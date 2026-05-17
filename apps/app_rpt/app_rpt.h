@@ -924,6 +924,7 @@ struct rpt {
 		const char *ldisc[MAX_LSTUFF];
 		int nldisc;
 		const char *timezone;
+		const char *remote_cmd_code; /*!< \brief Shared code word for HMAC authentication of remote commands (ilink,20) */
 		/*! \brief Path to rpt_auth.conf (TOTP user secrets); NULL disables the feature. */
 		const char *auth_users;
 		/*! \brief Sliding session timeout, seconds (default 300). */

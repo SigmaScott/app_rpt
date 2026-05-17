@@ -1013,6 +1013,7 @@ void load_rpt_vars(int n, int init)
 	RPT_CONFIG_VAR(eloutbound, "eloutbound");
 	RPT_CONFIG_VAR_DEFAULT(events, "events", "events");
 	RPT_CONFIG_VAR(timezone, "timezone");
+	RPT_CONFIG_VAR(remote_cmd_code, "remote_cmd_code");
 	RPT_CONFIG_VAR(auth_users, "auth_users");
 	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_timeout, "auth_timeout", 300, 30, 86400);
 	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_lockout_threshold, "auth_lockout_threshold", 5, 0, 1000);
