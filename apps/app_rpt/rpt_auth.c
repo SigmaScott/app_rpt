@@ -1,6 +1,7 @@
 
 #include "asterisk.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <string.h>
 #include <strings.h>
@@ -197,7 +198,7 @@ static int valid_user_id(const char *name)
 		return 0;
 	}
 	for (i = 0; i < RPT_AUTH_USER_ID_LEN; i++) {
-		if (name[i] < '0' || name[i] > '9') {
+		if (!isdigit(name[i])) {
 			return 0;
 		}
 	}

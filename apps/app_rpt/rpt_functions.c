@@ -7,6 +7,8 @@
 
 #include "asterisk.h"
 
+#include <ctype.h>
+
 #include "asterisk/app.h" /* use ast_safe_system */
 #include "asterisk/channel.h"
 #include "asterisk/file.h"
@@ -2055,7 +2057,7 @@ enum rpt_function_response function_auth(struct rpt *myrpt, char *param, char *d
 		return DC_ERROR;
 	}
 	for (i = 0; i < 10; i++) {
-		if (digits[i] < '0' || digits[i] > '9') {
+		if (!isdigit(digits[i])) {
 			return DC_ERROR;
 		}
 	}

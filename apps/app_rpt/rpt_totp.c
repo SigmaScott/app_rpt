@@ -1,6 +1,7 @@
 
 #include "asterisk.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -146,7 +147,7 @@ int rpt_totp_verify(const char *secret_b32, const char *otp6, uint64_t *last_cou
 		return RPT_TOTP_BAD_PARAM;
 	}
 	for (i = 0; i < 6; i++) {
-		if (otp6[i] < '0' || otp6[i] > '9') {
+		if (!isdigit(otp6[i])) {
 			return RPT_TOTP_BAD_PARAM;
 		}
 	}

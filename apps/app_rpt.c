@@ -1613,7 +1613,7 @@ static enum rpt_function_response collect_function_digits(struct rpt *myrpt, cha
 	int i, rv;
 	char *stringp, *action, *param, *functiondigits;
 	char function_table_name[30] = "";
-	char authed_stanza_buf[30] = "";
+	char authed_function_table_name[30] = "";
 	char workstring[200];
 
 	struct ast_variable *vp;
@@ -1648,8 +1648,8 @@ static enum rpt_function_response collect_function_digits(struct rpt *myrpt, cha
 	 * No-op when no active session.
 	 */
 	vp = NULL;
-	if (rpt_auth_get_active_stanza(myrpt, authed_stanza_buf, sizeof(authed_stanza_buf))) {
-		struct ast_variable *avp = ast_variable_browse(myrpt->cfg, authed_stanza_buf);
+	if (rpt_auth_get_active_stanza(myrpt, authed_function_table_name, sizeof(authed_function_table_name))) {
+		struct ast_variable *avp = ast_variable_browse(myrpt->cfg, authed_function_table_name);
 		while (avp) {
 			if (!strncasecmp(avp->name, digits, strlen(avp->name))) {
 				vp = avp;
