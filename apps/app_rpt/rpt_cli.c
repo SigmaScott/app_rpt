@@ -23,6 +23,7 @@
 #include "rpt_manager.h"
 #include "rpt_telemetry.h"
 #include "rpt_functions.h"
+#include "rpt_auth.h"
 
 extern struct rpt rpt_vars[MAXRPTS];
 
@@ -105,6 +106,11 @@ static int rpt_do_stats(int fd, int argc, const char *const *argv)
 			/* Make a copy of all stat variables while locked */
 			myrpt = &rpt_vars[i];
 			rpt_mutex_lock(&myrpt->lock);
+			if (!myrpt->links) {
+				rpt_mutex_unlock(&myrpt->lock);
+				return RESULT_FAILURE;
+			}
+
 			uptime = (int) (now - rpt_starttime());
 			dailytxtime = myrpt->dailytxtime;
 			totaltxtime = myrpt->totaltxtime;
@@ -363,6 +369,12 @@ static int rpt_do_lstats(int fd, int argc, const char *const *argv)
 
 			/* Make a copy of all stat variables while locked */
 			rpt_mutex_lock(&myrpt->lock);
+			if (!myrpt->links) {
+				ao2_cleanup(links_copy);
+				rpt_mutex_unlock(&myrpt->lock);
+				return RESULT_FAILURE;
+			}
+
 			if (ao2_container_dup(links_copy, myrpt->links, OBJ_NOLOCK)) {
 				ao2_cleanup(links_copy);
 				rpt_mutex_unlock(&myrpt->lock);
@@ -448,6 +460,13 @@ static int rpt_do_xnode(int fd, int argc, const char *const *argv)
 			/* Make a copy of all stat variables while locked */
 			myrpt = &rpt_vars[i];
 			rpt_mutex_lock(&myrpt->lock);
+
+			if (!myrpt->links) {
+				ast_free(lbuf);
+				rpt_mutex_unlock(&myrpt->lock);
+				return RESULT_FAILURE;
+			}
+
 			links_copy = ao2_container_clone(myrpt->links, OBJ_NOLOCK);
 			if (!links_copy) {
 				ast_free(lbuf);
@@ -765,6 +784,7 @@ static int rpt_do_restart(int fd, int argc, const char *const *argv)
 		return RESULT_SHOWUSAGE;
 	}
 
+	/* hanging up on the rx channel causes the rpt() thread to restart */
 	for (i = 0; i < nrpts; i++) {
 		if (rpt_vars[i].rxchannel) {
 			ast_softhangup(rpt_vars[i].rxchannel, AST_SOFTHANGUP_DEV);
@@ -787,6 +807,7 @@ static int rpt_do_fun(int fd, int argc, const char *const *argv)
 	for (i = 0; i < nrpts; i++) {
 		if (!strcmp(argv[2], rpt_vars[i].name)) {
 			struct rpt *myrpt = &rpt_vars[i];
+
 			macro_append(myrpt, argv[3]);
 		}
 	}
@@ -811,7 +832,10 @@ static int rpt_do_playback(int fd, int argc, const char *const *argv)
 	for (i = 0; i < nrpts; i++) {
 		if (!strcmp(argv[2], rpt_vars[i].name)) {
 			struct rpt *myrpt = &rpt_vars[i];
-			rpt_telemetry(myrpt, PLAYBACK, (void *) argv[3]);
+
+			if (myrpt->ready) {
+				rpt_telemetry(myrpt, PLAYBACK, (void *) argv[3]);
+			}
 		}
 	}
 
@@ -830,7 +854,10 @@ static int rpt_do_localplay(int fd, int argc, const char *const *argv)
 	for (i = 0; i < nrpts; i++) {
 		if (!strcmp(argv[2], rpt_vars[i].name)) {
 			struct rpt *myrpt = &rpt_vars[i];
-			rpt_telemetry(myrpt, LOCALPLAY, (void *) argv[3]);
+
+			if (myrpt->ready) {
+				rpt_telemetry(myrpt, LOCALPLAY, (void *) argv[3]);
+			}
 		}
 	}
 
@@ -872,8 +899,14 @@ static int rpt_do_sendtext(int fd, int argc, const char *const *argv)
 	for (i = 0; i < nrpts; i++) {
 		if (!strcmp(from, rpt_vars[i].name)) {
 			struct rpt *myrpt = &rpt_vars[i];
+
 			rpt_mutex_lock(&myrpt->lock);
 			/* otherwise, send it to all of em */
+			if (!myrpt->links) {
+				rpt_mutex_unlock(&myrpt->lock);
+				return RESULT_FAILURE;
+			}
+
 			ao2_callback(myrpt->links, OBJ_MULTIPLE | OBJ_NODATA, rpt_sendtext_cb, &str);
 			rpt_mutex_unlock(&myrpt->lock);
 		}
@@ -933,10 +966,7 @@ static int rpt_do_page(int fd, int argc, const char *const *argv)
 			telem = myrpt->tele.next;
 			while (telem != &myrpt->tele) {
 				if (((telem->mode == ID) || (telem->mode == ID1) || (telem->mode == IDTALKOVER)) && (!telem->killed)) {
-					if (telem->chan) {
-						ast_softhangup(telem->chan, AST_SOFTHANGUP_DEV); /* Whoosh! */
-					}
-					telem->killed = 1;
+					rpt_kill_telem(telem);
 					myrpt->deferid = 1;
 				}
 
@@ -985,8 +1015,14 @@ int rpt_do_sendall(int fd, int argc, const char *const *argv)
 	for (i = 0; i < nrpts; i++) {
 		if (!strcmp(nodename, rpt_vars[i].name)) {
 			struct rpt *myrpt = &rpt_vars[i];
+
 			rpt_mutex_lock(&myrpt->lock);
 			/* otherwise, send it to all of em */
+			if (!myrpt->links) {
+				rpt_mutex_unlock(&myrpt->lock);
+				return RESULT_FAILURE;
+			}
+
 			ao2_callback(myrpt->links, OBJ_MULTIPLE | OBJ_NODATA, rpt_sendtext_cb, &str);
 			rpt_mutex_unlock(&myrpt->lock);
 		}
@@ -1010,6 +1046,7 @@ static int rpt_do_fun1(int fd, int argc, const char *const *argv)
 	for (i = 0; i < nrpts; i++) {
 		if (!strcmp(argv[2], rpt_vars[i].name)) {
 			struct rpt *myrpt = &rpt_vars[i];
+
 			rpt_push_alt_macro(myrpt, (char *) argv[3]);
 		}
 	}
@@ -1047,6 +1084,12 @@ static int rpt_do_cmd(int fd, int argc, const char *const *argv)
 		ast_cli(fd, "Unknown node number %s.\n", argv[2]);
 		return RESULT_FAILURE;
 	} /* if thisRpt < 0 */
+
+	if (!myrpt->ready) {
+		/* Don't accept comamands for a node that is not ready */
+		ast_cli(fd, "Node %s is not ready.\n", argv[2]);
+		return RESULT_FAILURE;
+	}
 
 	/* Look up the action */
 	thisAction = rpt_function_lookup(argv[3]);
@@ -1611,6 +1654,79 @@ static char *handle_cli_show_version(struct ast_cli_entry *e, int cmd, struct as
 	return CLI_SUCCESS;
 }
 
+static int rpt_do_auth_show(int fd, int argc, const char *const *argv)
+{
+	int i;
+	int nrpts = rpt_num_rpts();
+	char status[256];
+
+	if (argc != 4) {
+		return RESULT_SHOWUSAGE;
+	}
+
+	for (i = 0; i < nrpts; i++) {
+		if (!strcmp(argv[3], rpt_vars[i].name)) {
+			rpt_auth_status(&rpt_vars[i], status, sizeof(status));
+			ast_cli(fd, "Node %s auth: %s\n", argv[3], status);
+			return RESULT_SUCCESS;
+		}
+	}
+	ast_cli(fd, "Node %s not found\n", argv[3]);
+	return RESULT_FAILURE;
+}
+
+static int rpt_do_auth_logout(int fd, int argc, const char *const *argv)
+{
+	int i;
+	int nrpts = rpt_num_rpts();
+
+	if (argc != 4) {
+		return RESULT_SHOWUSAGE;
+	}
+
+	for (i = 0; i < nrpts; i++) {
+		if (!strcmp(argv[3], rpt_vars[i].name)) {
+			rpt_auth_logout(&rpt_vars[i]);
+			ast_cli(fd, "Node %s auth session cleared\n", argv[3]);
+			return RESULT_SUCCESS;
+		}
+	}
+	ast_cli(fd, "Node %s not found\n", argv[3]);
+	return RESULT_FAILURE;
+}
+
+static char *handle_cli_auth_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "rpt auth show";
+		e->usage = "Usage: rpt auth show <nodename>\n"
+				   "	Show TOTP auth session status for the given node.\n";
+		return NULL;
+
+	case CLI_GENERATE:
+		return rpt_complete_node_list(a->line, a->word, a->pos, 3);
+	}
+
+	return res2cli(rpt_do_auth_show(a->fd, a->argc, a->argv));
+}
+
+static char *handle_cli_auth_logout(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "rpt auth logout";
+		e->usage = "Usage: rpt auth logout <nodename>\n"
+				   "	Force-clear the active TOTP auth session for the given node.\n";
+		return NULL;
+
+	case CLI_GENERATE:
+		return rpt_complete_node_list(a->line, a->word, a->pos, 3);
+	}
+
+	return res2cli(rpt_do_auth_logout(a->fd, a->argc, a->argv));
+}
+
 static struct ast_cli_entry rpt_cli[] = {
 	AST_CLI_DEFINE(handle_cli_debug, "Enable app_rpt debugging"),
 	AST_CLI_DEFINE(handle_cli_dump, "Dump app_rpt structs for debugging"),
@@ -1633,6 +1749,8 @@ static struct ast_cli_entry rpt_cli[] = {
 	AST_CLI_DEFINE(handle_cli_page, "Send a page to a user on a node"),
 	AST_CLI_DEFINE(handle_cli_lookup, "Lookup Allstar nodes"),
 	AST_CLI_DEFINE(handle_cli_show_version, "Show app_rpt version"),
+	AST_CLI_DEFINE(handle_cli_auth_show, "Show TOTP auth session status for a node"),
+	AST_CLI_DEFINE(handle_cli_auth_logout, "Force-logout TOTP auth session for a node"),
 };
 
 int rpt_cli_load(void)

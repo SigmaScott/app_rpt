@@ -663,8 +663,10 @@ static void kickptt(const struct chan_simpleusb_pvt *o)
 		return;
 	}
 	res = write(o->pttkick[1], &c, 1);
-	if (res <= 0) {
+	if (res < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		ast_log(LOG_ERROR, "Channel %s: Write failed: %s\n", o->name, strerror(errno));
+	} else if (res == 0) {
+		ast_log(LOG_ERROR, "Channel %s: Write returned 0 bytes unexpectedly\n", o->name);
 	}
 }
 
@@ -832,8 +834,8 @@ static int load_tune_config(struct chan_simpleusb_pvt *o, const struct ast_confi
 	}
 	if (!reload) {
 		/* Using the ternary operator in CV_STR won't work, due to butchering the sizeof, so copy after if needed */
-		strcpy(o->devstr, devstr); /* Safe */
-		strcpy(o->serial, serial); /* Safe */
+		ast_copy_string(o->devstr, devstr, sizeof(o->devstr)); /* Safe */
+		ast_copy_string(o->serial, serial, sizeof(o->serial)); /* Safe */
 	}
 	if (opened) {
 		ast_config_destroy(cfg2);
@@ -1109,10 +1111,11 @@ static void *hidthread(void *arg)
 			close(o->pttkick[1]);
 			o->pttkick[1] = -1;
 		}
-		if (pipe(o->pttkick) == -1) {
+		if (pipe2(o->pttkick, O_NONBLOCK) == -1) {
 			ast_log(LOG_ERROR, "Channel %s: Is not able to create a pipe\n", o->name);
 			pthread_exit(NULL);
 		}
+
 		if ((usb_dev->descriptor.idProduct & 0xfffc) == C108_PRODUCT_ID) {
 			o->devtype = C108_PRODUCT_ID;
 		} else {
@@ -1136,7 +1139,7 @@ static void *hidthread(void *arg)
 		o->had_gpios_in = 0;
 
 		memset(&rfds, 0, sizeof(rfds));
-		rfds[0].fd = o->pttkick[1];
+		rfds[0].fd = o->pttkick[0];
 		rfds[0].events = POLLIN;
 
 		ast_radio_time(&o->lasthidtime);
@@ -1158,8 +1161,10 @@ static void *hidthread(void *arg)
 				char c;
 
 				int bytes = read(o->pttkick[0], &c, 1);
-				if (bytes <= 0) {
+				if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 					ast_log(LOG_ERROR, "Channel %s: pttkick read failed: %s\n", o->name, strerror(errno));
+				} else if (bytes == 0) {
+					ast_log(LOG_ERROR, "Channel %s: pttkick pipe closed unexpectedly\n", o->name);
 				}
 			}
 			/* see if we need to process an eeprom read or write */
@@ -2860,9 +2865,9 @@ static int usb_device_swap(int fd, const char *other)
 		return -1;
 	}
 	ast_mutex_lock(&usb_dev_lock);
-	strcpy(tmp, p->devstr);
+	ast_copy_string(tmp, p->devstr, sizeof(tmp));
 	d = p->devicenum;
-	strcpy(p->devstr, o->devstr);
+	ast_copy_string(p->devstr, o->devstr, sizeof(p->devstr));
 	p->devicenum = o->devicenum;
 	ast_copy_string(o->devstr, tmp, sizeof(o->devstr));
 	o->devicenum = d;

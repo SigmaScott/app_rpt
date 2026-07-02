@@ -1,6 +1,6 @@
 #define VERSION_MAJOR 3
 #define VERSION_MINOR 9
-#define VERSION_PATCH 1
+#define VERSION_PATCH 3
 
 #include "asterisk/audiohook.h"
 
@@ -765,6 +765,8 @@ struct rpt {
 	ast_mutex_t lock;
 	ast_mutex_t remlock;
 	ast_mutex_t statpost_lock;
+	/*! \brief Per-node TOTP authentication state (opaque, see rpt_auth.c). */
+	struct rpt_auth_state *auth;
 	struct ast_config *cfg;
 	rpt_bool reload:1;
 	rpt_bool reload_request:1;
@@ -808,6 +810,8 @@ struct rpt {
 		int totime;
 		int time_out_reset_unkey_interval;
 		int time_out_reset_kerchunk_interval;
+		int first_keyup_min_time;
+		int first_keyup_inactivity_time;
 		int idtime;
 		int tailmessagetime;
 		int tailsquashedtime;
@@ -922,6 +926,18 @@ struct rpt {
 		const char *ldisc[MAX_LSTUFF];
 		int nldisc;
 		const char *timezone;
+		/*! \brief Path to rpt_auth.conf (TOTP user secrets); NULL disables the feature. */
+		const char *auth_users;
+		/*! \brief Sliding session timeout, seconds (default 300). */
+		int auth_timeout;
+		/*! \brief Failed-login attempts before lockout; 0 disables lockout (default 5). */
+		int auth_lockout_threshold;
+		/*! \brief Lockout duration, seconds (default 60). */
+		int auth_lockout_duration;
+		/*! \brief TOTP time step in seconds (RFC 6238; default 30). */
+		int auth_otp_step;
+		/*! \brief TOTP step window for clock skew tolerance (default 1). */
+		int auth_otp_window;
 	} p;
 	struct ao2_container *links;
 	int unkeytocttimer;
@@ -979,6 +995,8 @@ struct rpt {
 	rpt_bool mustid:1;
 	rpt_bool tailid:1;
 	int rptinacttimer;
+	int first_keyup_timer;
+	int first_keyup_inactivity_timer;
 	int tailevent;
 	int dtmfidx, rem_dtmfidx;
 	int dailytxtime, dailykerchunks, totalkerchunks, dailykeyups, totalkeyups, timeouts;
@@ -1146,7 +1164,14 @@ void donodelog(struct rpt *myrpt, char *str);
 #define donodelog_fmt(myrpt, fmt, ...) __donodelog_fmt(myrpt, __FILE__, __LINE__, __FUNCTION__, fmt, __VA_ARGS__)
 void __donodelog_fmt(struct rpt *myrpt, const char *file, int lineno, const char *func, const char *fmt, ...);
 
-void rpt_event_process(struct rpt *myrpt);
+/*!
+ * \brief Process RPT events for a repeater using a caller-owned channel reference.
+ *
+ * \param myrpt Non-NULL reference to the repeater structure.
+ * \param chan  Non-NULL channel reference that remains valid for the duration of this call.
+ */
+void rpt_event_process(struct rpt *myrpt, struct ast_channel *chan);
+
 void *rpt_call(void *this);
 
 /*!

@@ -25,6 +25,7 @@
 #include "rpt_manager.h"
 #include "rpt_utils.h" /* use myatoi */
 #include "rpt_rig.h"   /* use setrem */
+#include "rpt_auth.h"  /* TOTP per-user authentication */
 
 /*! \brief Echolink queryoption for retrieving call sign */
 #define ECHOLINK_QUERY_CALLSIGN 2
@@ -479,7 +480,7 @@ int node_lookup(struct rpt *myrpt, char *digitbuf, char *nodedata, size_t nodeda
 	val = ast_variable_retrieve(myrpt->cfg, myrpt->p.nodes, digitbuf);
 	if (val) {
 		if (nodedata && nodedatalength) {
-			snprintf(nodedata, nodedatalength, "%s", val);
+			ast_copy_string(nodedata, val, nodedatalength);
 			ast_debug(4, "Resolved by internal: node %s to %s\n", digitbuf, nodedata);
 		}
 		return 0;
@@ -489,7 +490,7 @@ int node_lookup(struct rpt *myrpt, char *digitbuf, char *nodedata, size_t nodeda
 		while (vp) {
 			if (ast_extension_match(vp->name, digitbuf)) {
 				if (nodedata && nodedatalength) {
-					snprintf(nodedata, nodedatalength, "%s", vp->value);
+					ast_copy_string(nodedata, vp->value, nodedatalength);
 					ast_debug(4, "Resolved by internal/wild: node %s to %s\n", digitbuf, nodedata);
 				}
 				return 0;
@@ -535,9 +536,8 @@ int node_lookup(struct rpt *myrpt, char *digitbuf, char *nodedata, size_t nodeda
 			}
 
 			ourcfg = ast_config_load(myrpt->p.extnodefiles[i], config_flags);
-
-			/* if file is not there, try the next one */
-			if (!ourcfg) {
+			if (!ourcfg || (ourcfg == CONFIG_STATUS_FILEINVALID)) {
+				/* if file is not present or not valid, try the next one */
 				continue;
 			}
 
@@ -675,6 +675,8 @@ void rpt_free_config_vars(struct rpt *myrpt)
 		ast_free(myrpt->p.ldisc_buf);
 		myrpt->p.ldisc_buf = NULL;
 	}
+
+	rpt_auth_free(myrpt);
 }
 
 void load_rpt_vars(int n, int init)
@@ -852,7 +854,10 @@ void load_rpt_vars(int n, int init)
 	RPT_CONFIG_VAR_INT_DEFAULT(voxrecover_ms, "voxrecover", VOX_RECOVER_MS);
 	RPT_CONFIG_VAR_INT_DEFAULT(simplexpatchdelay, "simplexpatchdelay", SIMPLEX_PATCH_DELAY);
 	RPT_CONFIG_VAR_INT_DEFAULT(simplexphonedelay, "simplexphonedelay", SIMPLEX_PHONE_DELAY);
-
+	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(first_keyup_min_time, "first_keyup_min_time", 0, 0, 1000);
+	RPT_CONFIG_VAR_INT_MIN_FLOOR(first_keyup_inactivity_time, "first_keyup_inactivity_time", 0, 0);
+	/* Convert to milliseconds for internal use */
+	rpt_vars[n].p.first_keyup_inactivity_time = rpt_vars[n].p.first_keyup_inactivity_time * 1000;
 	/* configure how "L" messages are sent */
 	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(linkpost_max_message_len, "linkpost_max_message_len", 0, 0, 10000);
 	if (rpt_vars[n].p.linkpost_max_message_len && (rpt_vars[n].p.linkpost_max_message_len < 500)) {
@@ -1010,6 +1015,12 @@ void load_rpt_vars(int n, int init)
 	RPT_CONFIG_VAR(eloutbound, "eloutbound");
 	RPT_CONFIG_VAR_DEFAULT(events, "events", "events");
 	RPT_CONFIG_VAR(timezone, "timezone");
+	RPT_CONFIG_VAR(auth_users, "auth_users");
+	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_timeout, "auth_timeout", 300, 30, 86400);
+	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_lockout_threshold, "auth_lockout_threshold", 5, 0, 1000);
+	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_lockout_duration, "auth_lockout_duration", 60, 0, 86400);
+	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_otp_step, "auth_otp_step", 30, 10, 120);
+	RPT_CONFIG_VAR_INT_DEFAULT_MIN_MAX(auth_otp_window, "auth_otp_window", 1, 0, 3);
 
 #ifdef __RPT_NOTCH
 	val = ast_variable_retrieve(cfg, this, "rxnotch");
@@ -1318,6 +1329,8 @@ void load_rpt_vars(int n, int init)
 		vp = vp->next;
 	}
 	ast_mutex_unlock(&rpt_vars[n].lock);
+
+	rpt_auth_reload(&rpt_vars[n]);
 }
 
 int rpt_push_alt_macro(struct rpt *myrpt, char *sptr)
@@ -1339,6 +1352,7 @@ int rpt_push_alt_macro(struct rpt *myrpt, char *sptr)
 
 void rpt_update_boolean(struct rpt *myrpt, char *varname, int newval)
 {
+	struct ast_channel *chan;
 	char buf[2];
 
 	if (!varname || !*varname) {
@@ -1351,11 +1365,24 @@ void rpt_update_boolean(struct rpt *myrpt, char *varname, int newval)
 		buf[0] = '1';
 	}
 
-	pbx_builtin_setvar_helper(myrpt->rxchannel, varname, buf);
-	rpt_manager_trigger(myrpt, varname, buf);
-	if (newval >= 0) {
-		rpt_event_process(myrpt);
+	rpt_mutex_lock(&myrpt->lock);
+	if (!myrpt->rxchannel) {
+		rpt_mutex_unlock(&myrpt->lock);
+		return;
 	}
+
+	chan = ast_channel_ref(myrpt->rxchannel);
+	rpt_mutex_unlock(&myrpt->lock);
+	if (!chan) {
+		return;
+	}
+
+	pbx_builtin_setvar_helper(chan, varname, buf);
+	rpt_manager_trigger(myrpt, chan, varname, buf);
+	if (newval >= 0) {
+		rpt_event_process(myrpt, chan);
+	}
+	ast_channel_unref(chan);
 }
 
 int rpt_is_valid_dns_name(const char *dns_name)
