@@ -315,7 +315,9 @@ enum rpt_phone_mode {
 	TELEMETRY_MODE(MDC1200) \
 	TELEMETRY_MODE(LASTUSER) \
 	TELEMETRY_MODE(REMCOMPLETE) \
-	TELEMETRY_MODE(PFXTONE)
+	TELEMETRY_MODE(PFXTONE) \
+	TELEMETRY_MODE(LOCALSTATUS) \
+	TELEMETRY_MODE(LOCALFULLSTATUS)
 
 enum rpt_tele_mode {
 #define TELEMETRY_MODE(name) name,
@@ -810,6 +812,8 @@ struct rpt {
 		int totime;
 		int time_out_reset_unkey_interval;
 		int time_out_reset_kerchunk_interval;
+		int first_keyup_min_time;
+		int first_keyup_inactivity_time;
 		int idtime;
 		int tailmessagetime;
 		int tailsquashedtime;
@@ -993,6 +997,8 @@ struct rpt {
 	rpt_bool mustid:1;
 	rpt_bool tailid:1;
 	int rptinacttimer;
+	int first_keyup_timer;
+	int first_keyup_inactivity_timer;
 	int tailevent;
 	int dtmfidx, rem_dtmfidx;
 	int dailytxtime, dailykerchunks, totalkerchunks, dailykeyups, totalkeyups, timeouts;
@@ -1160,7 +1166,14 @@ void donodelog(struct rpt *myrpt, char *str);
 #define donodelog_fmt(myrpt, fmt, ...) __donodelog_fmt(myrpt, __FILE__, __LINE__, __FUNCTION__, fmt, __VA_ARGS__)
 void __donodelog_fmt(struct rpt *myrpt, const char *file, int lineno, const char *func, const char *fmt, ...);
 
-void rpt_event_process(struct rpt *myrpt);
+/*!
+ * \brief Process RPT events for a repeater using a caller-owned channel reference.
+ *
+ * \param myrpt Non-NULL reference to the repeater structure.
+ * \param chan  Non-NULL channel reference that remains valid for the duration of this call.
+ */
+void rpt_event_process(struct rpt *myrpt, struct ast_channel *chan);
+
 void *rpt_call(void *this);
 
 /*!

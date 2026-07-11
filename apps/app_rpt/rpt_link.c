@@ -212,7 +212,7 @@ void rpt_qwrite(struct rpt_link *l, struct ast_frame *f)
 
 int linkcount(struct rpt *myrpt)
 {
-	return ao2_container_count(myrpt->links);
+	return myrpt->links ? ao2_container_count(myrpt->links) : 0;
 }
 
 void FindBestRssi(struct rpt *myrpt)
@@ -290,7 +290,7 @@ void rssi_send(struct rpt *myrpt)
 	};
 	char str[200];
 
-	sprintf(str, "R %i", myrpt->rxrssi);
+	snprintf(str, sizeof(str), "R %i", myrpt->rxrssi);
 	wf.datalen = strlen(str) + 1;
 	wf.data.ptr = str;
 	/* otherwise, send it to all of em */
@@ -334,6 +334,13 @@ void send_link_dtmf(struct rpt *myrpt, char c)
 	snprintf(str, sizeof(str), "D %s %s %d %c", myrpt->cmdnode, myrpt->name, ++(myrpt->dtmfidx), c);
 	wf.datalen = strlen(str) + 1;
 	wf.data.ptr = str;
+
+	rpt_mutex_lock(&myrpt->lock);
+	if (!myrpt->links) {
+		rpt_mutex_unlock(&myrpt->lock);
+		return;
+	}
+
 	/* first, see if our dude is there */
 	RPT_LIST_TRAVERSE(myrpt->links, l, l_it) {
 		if (l->name[0] == '0') {
@@ -346,12 +353,15 @@ void send_link_dtmf(struct rpt *myrpt, char c)
 			}
 			ao2_ref(l, -1);
 			ao2_iterator_destroy(&l_it);
+			rpt_mutex_unlock(&myrpt->lock);
 			return;
 		}
 	}
 	ao2_iterator_destroy(&l_it);
+
 	/* if not, give it to everyone */
 	ao2_callback(myrpt->links, OBJ_MULTIPLE | OBJ_NODATA, link_qwrite_cb, &wf);
+	rpt_mutex_unlock(&myrpt->lock);
 }
 
 void send_link_keyquery(struct rpt *myrpt)
@@ -371,8 +381,16 @@ void send_link_keyquery(struct rpt *myrpt)
 	wf.datalen = strlen(str) + 1;
 	wf.data.ptr = str;
 	/* give it to everyone */
+	rpt_mutex_lock(&myrpt->lock);
+	if (!myrpt->links) {
+		rpt_mutex_unlock(&myrpt->lock);
+		return;
+	}
+
+	rpt_mutex_unlock(&myrpt->lock);
 	ao2_callback(myrpt->links, OBJ_MULTIPLE | OBJ_NODATA, link_qwrite_cb, &wf);
 }
+
 void rpt_link_add(struct ao2_container *links, struct rpt_link *l)
 {
 	ast_assert(l != NULL);
@@ -432,6 +450,10 @@ int __mklinklist(struct rpt *myrpt, struct rpt_link *mylink, struct ast_str **bu
 	int i, spos, len, links_count = 0;
 
 	if (myrpt->remote) {
+		return 0;
+	}
+
+	if (!myrpt->links) {
 		return 0;
 	}
 
@@ -616,6 +638,7 @@ void __kickshort(struct rpt *myrpt)
 void rpt_update_links(struct rpt *myrpt)
 {
 	struct ast_str *buf, *obuf;
+	struct ast_channel *chan;
 	int n;
 
 	buf = ast_str_create(RPT_AST_STR_INIT_SIZE);
@@ -630,17 +653,31 @@ void rpt_update_links(struct rpt *myrpt)
 
 	rpt_mutex_lock(&myrpt->lock);
 	n = __mklinklist(myrpt, NULL, &buf, USE_FORMAT_RPT_ALINK);
-	rpt_mutex_unlock(&myrpt->lock);
 	/* parse em */
 	if (n) {
 		ast_str_set(&obuf, 0, "%d,%s", n, ast_str_buffer(buf));
 	}
-	pbx_builtin_setvar_helper(myrpt->rxchannel, "RPT_ALINKS", ast_str_buffer(obuf));
-	rpt_manager_trigger(myrpt, "RPT_ALINKS", ast_str_buffer(obuf));
-	ast_str_set(&obuf, 0, "%d", n);
-	pbx_builtin_setvar_helper(myrpt->rxchannel, "RPT_NUMALINKS", ast_str_buffer(obuf));
-	rpt_manager_trigger(myrpt, "RPT_NUMALINKS", ast_str_buffer(obuf));
 
+	if (!myrpt->rxchannel) {
+		ast_free(buf);
+		ast_free(obuf);
+		rpt_mutex_unlock(&myrpt->lock);
+		return;
+	}
+
+	chan = ast_channel_ref(myrpt->rxchannel);
+	rpt_mutex_unlock(&myrpt->lock);
+	if (!chan) {
+		ast_free(buf);
+		ast_free(obuf);
+		return;
+	}
+
+	pbx_builtin_setvar_helper(chan, "RPT_ALINKS", ast_str_buffer(obuf));
+	rpt_manager_trigger(myrpt, chan, "RPT_ALINKS", ast_str_buffer(obuf));
+	ast_str_set(&obuf, 0, "%d", n);
+	pbx_builtin_setvar_helper(chan, "RPT_NUMALINKS", ast_str_buffer(obuf));
+	rpt_manager_trigger(myrpt, chan, "RPT_NUMALINKS", ast_str_buffer(obuf));
 	ast_str_reset(buf);
 	rpt_mutex_lock(&myrpt->lock);
 	n = __mklinklist(myrpt, NULL, &buf, USE_FORMAT_RPT_LINK);
@@ -648,12 +685,13 @@ void rpt_update_links(struct rpt *myrpt)
 	if (n) {
 		ast_str_set(&obuf, 0, "%d,%s", n, ast_str_buffer(buf));
 	}
-	pbx_builtin_setvar_helper(myrpt->rxchannel, "RPT_LINKS", ast_str_buffer(obuf));
-	rpt_manager_trigger(myrpt, "RPT_LINKS", ast_str_buffer(obuf));
+	pbx_builtin_setvar_helper(chan, "RPT_LINKS", ast_str_buffer(obuf));
+	rpt_manager_trigger(myrpt, chan, "RPT_LINKS", ast_str_buffer(obuf));
 	ast_str_set(&obuf, 0, "%d", n);
-	pbx_builtin_setvar_helper(myrpt->rxchannel, "RPT_NUMLINKS", ast_str_buffer(obuf));
-	rpt_manager_trigger(myrpt, "RPT_NUMLINKS", ast_str_buffer(obuf));
-	rpt_event_process(myrpt);
+	pbx_builtin_setvar_helper(chan, "RPT_NUMLINKS", ast_str_buffer(obuf));
+	rpt_manager_trigger(myrpt, chan, "RPT_NUMLINKS", ast_str_buffer(obuf));
+	rpt_event_process(myrpt, chan);
+	ast_channel_unref(chan);
 
 	ast_free(buf);
 	ast_free(obuf);
@@ -696,7 +734,7 @@ void *rpt_link_connect(void *data)
 		if (!strchr(s1, ':') && strchr(s1, '/') && strncasecmp(s1, "local/", 6) && strncasecmp(s1, "echolink/", 9)) {
 			sy = strchr(s1, '/');
 			*sy = 0;
-			sprintf(sx, "%s:4569/%s", s1, sy + 1);
+			snprintf(sx, sizeof(sx), "%s:4569/%s", s1, sy + 1);
 			s1 = sx;
 		}
 		strsep(&s, ",");

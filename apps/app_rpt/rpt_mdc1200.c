@@ -75,8 +75,22 @@ void mdc1200_notify(struct rpt *myrpt, char *fromnode, char *data)
 	char str[50];
 	struct flock fl;
 	time_t t;
+	struct ast_channel *chan;
 
-	rpt_manager_trigger(myrpt, "MDC-1200", data);
+	rpt_mutex_lock(&myrpt->lock);
+	if (!myrpt->rxchannel) {
+		rpt_mutex_unlock(&myrpt->lock);
+		return;
+	}
+
+	chan = ast_channel_ref(myrpt->rxchannel);
+	rpt_mutex_unlock(&myrpt->lock);
+	if (!chan) {
+		return;
+	}
+
+	rpt_manager_trigger(myrpt, chan, "MDC-1200", data);
+	ast_channel_unref(chan);
 
 	if (!fromnode) {
 		ast_verb(4, "Got MDC-1200 data %s from local system (%s)\n", data, myrpt->name);
@@ -124,12 +138,17 @@ void mdc1200_send(struct rpt *myrpt, char *data)
 		return;
 	}
 
-	sprintf(str, "I %s %s", myrpt->name, data);
+	snprintf(str, sizeof(str), "I %s %s", myrpt->name, data);
 	wf.data.ptr = str;
 	wf.datalen = strlen(str) + 1; /* Isuani, 20141001 */
 
 	/* otherwise, send it to all of em */
 	rpt_mutex_lock(&myrpt->lock);
+	if (!myrpt->links) {
+		rpt_mutex_unlock(&myrpt->lock);
+		return;
+	}
+
 	RPT_LIST_TRAVERSE(myrpt->links, l, l_it) {
 		/* Dont send to IAXRPT client, unless main channel is Voter */
 		if (((l->name[0] == '0') && !CHAN_TECH(myrpt->rxchannel, "voter")) || (l->phonemode)) {
@@ -139,6 +158,7 @@ void mdc1200_send(struct rpt *myrpt, char *data)
 			rpt_qwrite(l, &wf);
 		}
 	}
+
 	rpt_mutex_unlock(&myrpt->lock);
 	ao2_iterator_destroy(&l_it);
 }
