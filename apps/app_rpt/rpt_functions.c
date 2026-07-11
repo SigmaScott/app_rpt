@@ -7,6 +7,8 @@
 
 #include "asterisk.h"
 
+#include <ctype.h>
+
 #include "asterisk/app.h" /* use ast_safe_system */
 #include "asterisk/channel.h"
 #include "asterisk/file.h"
@@ -26,6 +28,7 @@
 #include "rpt_functions.h"
 #include "rpt_rig.h"
 #include "rpt_radio.h"
+#include "rpt_auth.h"
 
 /*!
  * \brief DTMF Tones - frequency pairs used to generate them along with the required timings
@@ -156,9 +159,15 @@ enum rpt_function_response function_ilink(struct rpt *myrpt, char *param, char *
 			break;
 		}
 		if ((digitbuf[0] == '0') && (myrpt->lastlinknode[0])) {
-			strcpy(digitbuf, myrpt->lastlinknode);
+			ast_copy_string(digitbuf, myrpt->lastlinknode, sizeof(digitbuf));
 		}
+
 		rpt_mutex_lock(&myrpt->lock);
+		if (!myrpt->links) {
+			rpt_mutex_unlock(&myrpt->lock);
+			break;
+		}
+
 		/* try to find this one in queue */
 		l = ao2_find(myrpt->links, digitbuf, 0);
 		if (!l) { /* if not found */
@@ -255,7 +264,7 @@ enum rpt_function_response function_ilink(struct rpt *myrpt, char *param, char *
 			break;
 		}
 		/* if doesn't allow link cmd, or no links active, return */
-		if (!ao2_container_count(myrpt->links)) {
+		if (!myrpt->links || !ao2_container_count(myrpt->links)) {
 			return DC_COMPLETE;
 		}
 		if ((command_source != SOURCE_RPT) && (command_source != SOURCE_PHONE) && (command_source != SOURCE_ALT) &&
@@ -284,7 +293,7 @@ enum rpt_function_response function_ilink(struct rpt *myrpt, char *param, char *
 			return DC_ERROR;
 		}
 		rpt_mutex_lock(&myrpt->lock);
-		strcpy(myrpt->lastlinknode, digitbuf);
+		ast_copy_string(myrpt->lastlinknode, digitbuf, sizeof(myrpt->lastlinknode));
 		ast_copy_string(myrpt->cmdnode, digitbuf, sizeof(myrpt->cmdnode));
 		rpt_mutex_unlock(&myrpt->lock);
 		rpt_telem_select(myrpt, command_source, mylink);
@@ -304,6 +313,12 @@ enum rpt_function_response function_ilink(struct rpt *myrpt, char *param, char *
 	case 6: /* All Links Off, including permalinks */
 		rpt_mutex_lock(&myrpt->lock);
 		myrpt->savednodes[0] = 0;
+
+		if (!myrpt->links) {
+			rpt_mutex_unlock(&myrpt->lock);
+			return DC_COMPLETE;
+		}
+
 		/* loop through all links */
 		RPT_LIST_TRAVERSE(myrpt->links, l, l_it) {
 			char c1;
@@ -321,7 +336,7 @@ enum rpt_function_response function_ilink(struct rpt *myrpt, char *param, char *
 			}
 
 			/* Make a string of disconnected nodes for possible restoration */
-			sprintf(tmp, "%c%c%.290s", c1, (l->perma) ? 'P' : 'T', l->name);
+			snprintf(tmp, sizeof(tmp), "%c%c%.290s", c1, (l->perma) ? 'P' : 'T', l->name);
 			if (strlen(tmp) + strlen(myrpt->savednodes) + 1 < MAXNODESTR) {
 				if (myrpt->savednodes[0])
 					strcat(myrpt->savednodes, ",");
@@ -376,9 +391,13 @@ enum rpt_function_response function_ilink(struct rpt *myrpt, char *param, char *
 		*s2 = 0;
 		snprintf(tmp, MIN(sizeof(tmp), MAX_TEXTMSG_SIZE), "M %s %s %s", myrpt->name, s1 + 1, s2 + 1);
 		rpt_mutex_lock(&myrpt->lock);
-		/* otherwise, send it to all of em */
-		ao2_callback(myrpt->links, OBJ_MULTIPLE | OBJ_NODATA, rpt_sendtext_cb, tmp);
 
+		if (!myrpt->links) {
+			rpt_mutex_unlock(&myrpt->lock);
+			return DC_COMPLETE;
+		}
+
+		ao2_callback(myrpt->links, OBJ_MULTIPLE | OBJ_NODATA, rpt_sendtext_cb, tmp);
 		rpt_mutex_unlock(&myrpt->lock);
 		rpt_telemetry(myrpt, COMPLETE, NULL);
 		return DC_COMPLETE;
@@ -1150,10 +1169,7 @@ enum rpt_function_response function_status(struct rpt *myrpt, char *param, char 
 		telem = myrpt->tele.next;
 		while (telem != &myrpt->tele) {
 			if (((telem->mode == ID) || (telem->mode == ID1)) && (!telem->killed)) {
-				if (telem->chan) {
-					ast_softhangup(telem->chan, AST_SOFTHANGUP_DEV); /* Whoosh! */
-				}
-				telem->killed = 1;
+				rpt_kill_telem(telem);
 			}
 			telem = telem->next;
 		}
@@ -1185,10 +1201,7 @@ enum rpt_function_response function_status(struct rpt *myrpt, char *param, char 
 		telem = myrpt->tele.next;
 		while (telem != &myrpt->tele) {
 			if (((telem->mode == ID) || (telem->mode == ID1)) && (!telem->killed)) {
-				if (telem->chan) {
-					ast_softhangup(telem->chan, AST_SOFTHANGUP_DEV); /* Whoosh! */
-				}
-				telem->killed = 1;
+				rpt_kill_telem(telem);
 			}
 			telem = telem->next;
 		}
@@ -1198,6 +1211,15 @@ enum rpt_function_response function_status(struct rpt *myrpt, char *param, char 
 	case 12: /* System Time (local only) */
 		rpt_telemetry(myrpt, STATS_TIME_LOCAL, NULL);
 		return DC_COMPLETE;
+	case 13: /* Local System status (ILINK, 5) */
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, LOCALSTATUS, NULL);
+		return DC_COMPLETE;
+	case 14: /* Local Full System status (ILINK, 15) */
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, LOCALFULLSTATUS, NULL);
+		return DC_COMPLETE;
+
 	case 99: /* GPS data announced locally */
 		rpt_telem_select(myrpt, command_source, mylink);
 		rpt_telemetry(myrpt, STATS_GPS_LEGACY, NULL);
@@ -1904,10 +1926,10 @@ enum rpt_function_response function_cop(struct rpt *myrpt, char *param, char *di
 		/* go thru all the specs */
 		for (i = 1; i < argc; i++) {
 			if (sscanf(argv[i], "%*[Gg]%*[Pp]%*[Ii]%*[oO]" N_FMT(d) "%*[=:]" N_FMT(d), &j, &k) == 2) {
-				sprintf(string, "GPIO %d %d", j, k);
+				snprintf(string, sizeof(string), "GPIO %d %d", j, k);
 				ast_sendtext(myrpt->rxchannel, string);
 			} else if (sscanf(argv[i], "%*2[pP]" N_FMT(d) "=" N_FMT(d), &j, &k) == 2) {
-				sprintf(string, "PP %d %d", j, k);
+				snprintf(string, sizeof(string), "PP %d %d", j, k);
 				ast_sendtext(myrpt->rxchannel, string);
 			} else {
 				ast_log(LOG_WARNING, "Invalid command COP %s, %s", argv[0], argv[i]);
@@ -1936,6 +1958,9 @@ enum rpt_function_response function_cop(struct rpt *myrpt, char *param, char *di
 		}
 		return DC_COMPLETE;
 	case 65: /* send POCSAG page */
+	{
+		int written;
+
 		if (argc < 3) {
 			break;
 		}
@@ -1943,20 +1968,24 @@ enum rpt_function_response function_cop(struct rpt *myrpt, char *param, char *di
 			/* ignore if not a USB channel */
 			break;
 		}
+
 		if (argc > 5) {
-			sprintf(string, "PAGE %s %s %s %s %s", argv[1], argv[2], argv[3], argv[4], argv[5]);
+			written = snprintf(string, sizeof(string), "PAGE %s %s %s %s %s", argv[1], argv[2], argv[3], argv[4], argv[5]);
 		} else {
-			sprintf(string, "PAGE %s %s %s", argv[1], argv[2], argv[3]);
+			written = snprintf(string, sizeof(string), "PAGE %s %s %s", argv[1], argv[2], argv[3]);
 		}
+
+		if (written < 0 || written >= sizeof(string)) {
+			ast_log(LOG_WARNING, "app_rpt: POCSAG PAGE message too long, command rejected\n");
+			return DC_ERROR;
+		}
+
 		rpt_mutex_lock(&myrpt->lock);
 		telem = myrpt->tele.next;
 		k = 0;
 		while (telem != &myrpt->tele) {
 			if (((telem->mode == ID) || (telem->mode == ID1) || (telem->mode == IDTALKOVER)) && (!telem->killed)) {
-				if (telem->chan) {
-					ast_softhangup(telem->chan, AST_SOFTHANGUP_DEV); /* Whoosh! */
-				}
-				telem->killed = 1;
+				rpt_kill_telem(telem);
 				myrpt->deferid = 1;
 			}
 			telem = telem->next;
@@ -1965,6 +1994,7 @@ enum rpt_function_response function_cop(struct rpt *myrpt, char *param, char *di
 		gettimeofday(&myrpt->paging, NULL);
 		ast_sendtext(myrpt->rxchannel, string);
 		return DC_COMPLETE;
+	}
 	}
 	return DC_INDETERMINATE;
 }
@@ -2020,4 +2050,77 @@ enum rpt_function_response function_cmd(struct rpt *myrpt, char *param, char *di
 		}
 	}
 	return DC_COMPLETE;
+}
+
+/*
+ * param selects the sub-command:
+ *   "a" — authenticate (login):  expects exactly 10 trailing digits
+ *                                 (4-digit user-id + 6-digit OTP)
+ *   "s" — status:                no trailing digits expected
+ *   "l" — logout:                no trailing digits expected
+ *
+ * Example rpt.conf entries (assuming funcchar='*'):
+ *   A1 = auth,a    ; *A1<10 digits>   login
+ *   A2 = auth,s    ; *A2              status query
+ *   A3 = auth,l    ; *A3              logout
+ */
+enum rpt_function_response function_auth(struct rpt *myrpt, char *param, char *digitbuf, enum rpt_command_source command_source,
+	struct rpt_link *mylink)
+{
+	const char *digits = digitbuf ? digitbuf : "";
+	size_t len = strlen(digits);
+	const char *subcmd = (param && *param) ? param : "";
+	size_t i;
+	int rc;
+
+	if (myrpt->remote) {
+		return DC_ERROR;
+	}
+
+	ast_debug(1, "auth subcmd=%s digitbuf_len=%zu source=%d\n", subcmd, len, command_source);
+
+	if (!strcasecmp(subcmd, "s")) {
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, COMPLETE, NULL);
+		return DC_COMPLETEQUIET;
+	}
+
+	if (!strcasecmp(subcmd, "l")) {
+		rpt_auth_logout(myrpt);
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, COMPLETE, NULL);
+		return DC_COMPLETEQUIET;
+	}
+
+	/* Default / "a" — login: need exactly 10 decimal digits */
+	if (len < 10) {
+		return DC_INDETERMINATE;
+	}
+	if (len != 10) {
+		return DC_ERROR;
+	}
+	for (i = 0; i < 10; i++) {
+		if (!isdigit(digits[i])) {
+			return DC_ERROR;
+		}
+	}
+
+	{
+		char user_id4[5], otp6[7];
+
+		memcpy(user_id4, digits, 4);
+		user_id4[4] = '\0';
+		memcpy(otp6, digits + 4, 6);
+		otp6[6] = '\0';
+
+		rc = rpt_auth_login(myrpt, user_id4, otp6);
+	}
+
+	if (rc == RPT_AUTH_LOGIN_OK) {
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, COMPLETE, NULL);
+		return DC_COMPLETEQUIET;
+	}
+
+	return DC_ERROR;
 }

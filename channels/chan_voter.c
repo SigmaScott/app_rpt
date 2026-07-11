@@ -329,7 +329,6 @@ Use "core show help voter <command>"" to display usage.
 #include "asterisk/format_compatibility.h"
 #include "asterisk/timing.h"
 #include "asterisk/rpt_chan_shared.h"
-
 #include "../apps/app_rpt/pocsag.c"
 
 /* This array is used by the voter tune CLI command to send a 1kHz tone at
@@ -402,14 +401,14 @@ char context[100];
 #define PAGER_SRC "PAGER"
 #define ENDPAGE_STR "ENDPAGE"
 #define AMPVAL 30000
-#define SAMPRATE 8000 /* (Sample Rate) */
+#define AST_SAMPLE_RATE 8000 /* (Sample Rate) */
 #define DIVLCM 192000 /* (A common multiple of 512,1200,2400,8000) */
 #define PREAMBLE_BITS 576
 #define MESSAGE_BITS 544 /* (17 * 32), 1 longword SYNC plus 16 longwords data */
 /* We have to send "inverted"... probably because of inverting AMP in Voter board. */
 #define ONEVAL AMPVAL
 #define ZEROVAL -AMPVAL
-#define DIVSAMP (DIVLCM / SAMPRATE)
+#define DIVSAMP (DIVLCM / AST_SAMPLE_RATE)
 
 /* Defines voter payload types. */
 #define VOTER_PAYLOAD_AUTH 0
@@ -1224,9 +1223,9 @@ static int voter_text(struct ast_channel *ast, const char *text)
 			i++;
 		}
 		/* Get number of samples to alloc for audio. */
-		audio_samples = (SAMPRATE * (PREAMBLE_BITS + (MESSAGE_BITS * i))) / baud;
+		audio_samples = (AST_SAMPLE_RATE * (PREAMBLE_BITS + (MESSAGE_BITS * i))) / baud;
 		/* Pad end with 250ms of silence on each side. */
-		audio_samples += SAMPRATE / 2;
+		audio_samples += AST_SAMPLE_RATE / 2;
 		/* Also pad up to FRAME_SIZE. */
 		audio_samples += audio_samples % FRAME_SIZE;
 		audio = ast_calloc(1, (audio_samples * sizeof(short)) + 10);
@@ -1236,7 +1235,7 @@ static int voter_text(struct ast_channel *ast, const char *text)
 		}
 		divdiv = DIVLCM / baud;
 		divcnt = 0;
-		audio_ptr = SAMPRATE / 4;
+		audio_ptr = AST_SAMPLE_RATE / 4;
 		for (i = 0; i < (PREAMBLE_BITS / 32); i++) {
 			mkpsamples(audio, 0xaaaaaaaa, &audio_ptr, &divcnt, divdiv);
 		}
@@ -2953,7 +2952,7 @@ static void *voter_primary_client(void *data)
 		if (!p->priconn && (ast_tvzero(lasttx) || (voter_tvdiff_ms(tv, lasttx) >= 500))) {
 			authpacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
 			authpacket.vp.curtime.vtime_nsec = htonl(voter_timing_count);
-			strcpy((char *) authpacket.vp.challenge, challenge);
+			ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
 			authpacket.vp.digest = htonl(resp_digest);
 			authpacket.flags = 32;
 			ast_debug(3, "VOTER %i: Sent primary client auth to %s:%d\n", p->nodenum, ast_inet_ntoa(p->primary.sin_addr),
@@ -2968,7 +2967,7 @@ static void *voter_primary_client(void *data)
 		if (p->priconn && (ast_tvzero(lasttx) || (voter_tvdiff_ms(tv, lasttx) >= 1000))) {
 			authpacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
 			authpacket.vp.curtime.vtime_nsec = htonl(voter_timing_count);
-			strcpy((char *) authpacket.vp.challenge, challenge);
+			ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
 			authpacket.vp.digest = htonl(resp_digest);
 			authpacket.vp.payload_type = htons(VOTER_PAYLOAD_GPS);
 			ast_debug(5, "VOTER %i: Sent primary client keepalive to %s:%d\n", p->nodenum, ast_inet_ntoa(p->primary.sin_addr),
@@ -3006,7 +3005,7 @@ static void *voter_primary_client(void *data)
 				/* If this is a new session. */
 				if (strcmp((char *) vph->challenge, p->primary_challenge)) {
 					resp_digest = crc32_bufs((char *) vph->challenge, p->primary_pswd);
-					strcpy(p->primary_challenge, (char *) vph->challenge);
+					ast_copy_string(p->primary_challenge, (char *) vph->challenge, sizeof(p->primary_challenge));
 					p->priconn = 0;
 				} else {
 					if (!digest || !vph->digest || (digest != ntohl(vph->digest)) ||
@@ -3211,7 +3210,7 @@ static void *voter_xmit(void *data)
 		if (x || mx) {
 			memset(&audiopacket, 0, sizeof(audiopacket) - sizeof(audiopacket.audio));
 			memset(&audiopacket.audio, 0xff, sizeof(audiopacket.audio));
-			strcpy((char *) audiopacket.vp.challenge, challenge);
+			ast_copy_string((char *) audiopacket.vp.challenge, challenge, sizeof(audiopacket.vp.challenge));
 			audiopacket.vp.payload_type = htons(VOTER_PAYLOAD_ULAW);
 			audiopacket.rssi = 0;
 			if (f1) {
@@ -3461,7 +3460,7 @@ static void *voter_xmit(void *data)
 				}
 				pingpacket.txtime = tv;
 				pingpacket.starttime = client->ping_txtime;
-				strcpy((char *) pingpacket.vp.challenge, challenge);
+				ast_copy_string((char *) pingpacket.vp.challenge, challenge, sizeof(pingpacket.vp.challenge));
 				pingpacket.vp.payload_type = htons(VOTER_PAYLOAD_PING);
 				pingpacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
 				pingpacket.vp.curtime.vtime_nsec = htonl(master_time.vtime_nsec);
@@ -3492,7 +3491,7 @@ static void *voter_xmit(void *data)
 			 */
 			if (ast_tvzero(client->lastsenttime) || (voter_tvdiff_ms(tv, client->lastsenttime) >= TX_KEEPALIVE_MS)) {
 				memset(&audiopacket, 0, sizeof(audiopacket));
-				strcpy((char *) audiopacket.vp.challenge, challenge);
+				ast_copy_string((char *) audiopacket.vp.challenge, challenge, sizeof(audiopacket.vp.challenge));
 				audiopacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
 				audiopacket.vp.payload_type = htons(VOTER_PAYLOAD_GPS);
 				audiopacket.vp.digest = htonl(client->respdigest);
@@ -3901,8 +3900,8 @@ static int reload(void)
 		/* Reset dmwdiag to disabled upon reload */
 		p->dmwdiag = 0;
 		oldctcss[0] = 0;
-		strcpy(oldctcss, p->txctcssfreq);
-		sprintf(data, "%d", p->nodenum);
+		ast_copy_string(oldctcss, p->txctcssfreq, sizeof(oldctcss));
+		snprintf(data, sizeof(data), "%d", p->nodenum);
 		if (ast_variable_browse(cfg, data) == NULL) {
 			continue;
 		}
@@ -4729,7 +4728,7 @@ static void *voter_reader(void *data)
 							isproxy = 1;
 							if (!p->isprimary) {
 								vph->digest = htonl(client->respdigest);
-								strcpy((char *) vph->challenge, challenge);
+								ast_copy_string((char *) vph->challenge, challenge, sizeof(vph->challenge));
 								sendto(udp_socket, buf, recvlen - sizeof(proxy), 0, (struct sockaddr *) &psin, sizeof(psin));
 								continue;
 							}
@@ -4894,7 +4893,7 @@ static void *voter_reader(void *data)
 							/* If otherwise (RSSI > 0), if ADPCM audio packet, translate it. */
 #ifdef ADPCM_LOOPBACK
 							memset(&audiopacket, 0, sizeof(audiopacket));
-							strcpy((char *) audiopacket.vp.challenge, challenge);
+							ast_copy_string((char *) audiopacket.vp.challenge, challenge, sizeof(audiopacket.vp.challenge));
 							audiopacket.vp.payload_type = htons(VOTER_PAYLOAD_ADPCM);
 							audiopacket.rssi = 0;
 							memcpy(audiopacket.audio, buf + sizeof(VOTER_PACKET_HEADER) + 1, FRAME_SIZE + 3);
@@ -5259,12 +5258,16 @@ static void *voter_reader(void *data)
 								}
 								stream.curtime = master_time;
 								memcpy(stream.audio, p->buf + AST_FRIENDLY_OFFSET, FRAME_SIZE);
-								sprintf(stream.str, "%s", maxclient->name);
+								ast_copy_string(stream.str, maxclient->name, sizeof(stream.str));
 								for (client = clients; client; client = client->next) {
+									int size;
+
 									if (client->nodenum != p->nodenum) {
 										continue;
 									}
-									sprintf(stream.str + strlen(stream.str), ",%s=%d", client->name, client->lastrssi);
+
+									size = strlen(stream.str);
+									snprintf(stream.str + size, sizeof(stream.str) - size, ",%s=%d", client->name, client->lastrssi);
 								}
 								for (i = 0; i < p->nstreams; i++) {
 									cp = ast_strdup(p->streams[i]);
@@ -5467,7 +5470,7 @@ process_gps:
 		/* Our unique challenge is created in load_module. Copy our challenge into
 		 * the packet header.
 		 */
-		strcpy((char *) authpacket.vp.challenge, challenge);
+		ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
 
 		/* Put our current system time into the packet header. */
 		gettimeofday(&tv, NULL);
