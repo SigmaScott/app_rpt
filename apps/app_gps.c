@@ -40,14 +40,17 @@
  * to generate the password: https://n5dux.com/ham/aprs-passcode/
  *
  * app_gps can connect to a serial GPS receiver to get position information.
+ * If gpsd_host is configured, position is read from a local gpsd JSON stream
+ * (TCP port 2947 by default) instead of a serial NMEA device.
  * If a GPS receiver is not configured, it can provide default position information
- * entered in the gps.conf file.  It decodes the NEMA-0183 $GPGGA sentence.
+ * entered in the gps.conf file.  It decodes NMEA-0183 GGA sentences ($GPGGA,
+ * $GNGGA, etc.).
  *
  * The $GPGGA sentence looks like the following:
  * $GPGGA,011530.00,3255.21780,N,08556.91695,W,2,06,3.45,217.4,M,-30.3,M,,0000*63
  *
  * Name	                  Example Data        Description
- * Sentence Identifier	  $GPGGA              Global Positioning System Fix Data
+ * Sentence Identifier	  $xxGGA              Global Positioning System Fix Data
  * Time                   011530.00           01:15:30 UTC
  * Latitude               3255.21780          32.920297°N or 32° 55' 13.0692"N
  * Latitude direction	  N                   N = North or S = South
@@ -251,9 +254,12 @@
 #define TT_COMMON "/tmp/aprs_ttcommon"
 #define TT_SUB_COMMON "/tmp/aprs_ttcommon_%s"
 #define GPS_DEFAULT_BAUDRATE B4800
+#define GPS_DEFAULT_GPSD_PORT 2947
+#define GPS_MAX_GPSD_PORT 65535
 #define GPS_UPDATE_SECS 60
 #define GPS_VALID_SECS 60
 #define SERIAL_MAXMS 10000
+#define JSON_KEY(x) "\"" #x "\":"
 
 /*!
  * \brief APRS TT entry.
@@ -275,8 +281,19 @@ static int run_forever = 1;
 
 /* Global configuration information */
 static char *comport, *server, *port;
+static char *gpsd_host = NULL;
 static int baudrate;
+static int gpsd_port = GPS_DEFAULT_GPSD_PORT;
+static int gpsd_sockfd = -1;
 static int sockfd = -1;
+
+enum gps_source_type {
+	GPS_SOURCE_NONE = 0,
+	GPS_SOURCE_SERIAL,
+	GPS_SOURCE_GPSD,
+};
+
+static enum gps_source_type gps_source = GPS_SOURCE_NONE;
 
 /* Message flags */
 static int gps_unlock_shown = 0;
@@ -416,41 +433,63 @@ static int getserialchar(int fd)
 }
 
 /*!
- * \brief Get a line of characters from serial device.
+ * \brief Read one complete NMEA sentence from serial device.
  *
- * Get one line of characters from the serial device.  Timeout after SERIAL_MAXMS.
+ * Discards bytes until a '$' start-of-sentence marker is found, then reads
+ * until end-of-line.  This keeps the reader aligned when pseudo-serial bridges
+ * deliver data mid-stream.
  *
  * \param fd		File descriptor to read.
- * \param str		Pointer to string buffer.
- * \param max		Maximum characters to read.
+ * \param buf		Buffer for the NMEA sentence.
+ * \param buflen	Buffer size (including NUL terminator).
  *
  * \retval 			Number of characters read, 0 for time out or -1 for error.
  */
-
-static int getserialline(int fd, char *str, int max)
+static int getnmea_line(int fd, char *buf, size_t buflen)
 {
-	int i;
-	char c;
+	size_t i;
+	int ch;
 
-	for (i = 0; (i < max) && run_forever; i++) {
-		c = getserialchar(fd);
-		/* See if we timed out or received an error */
-		if (c < 1) {
-			return c;
+	if (buflen < 2) {
+		return -1;
+	}
+
+	while (run_forever) {
+		ch = getserialchar(fd);
+		if (ch < 1) {
+			return ch;
 		}
-		if ((i == 0) && (c < ' ')) {
-			i--;
-			continue;
-		}
-		/* Any character < ' ' indicates the end of line */
-		if (c < ' ') {
+		if (ch == '$') {
+			/* Resync to the start of the next NMEA sentence. */
+			buf[0] = (char) ch;
 			break;
 		}
-		str[i] = c;
+		ast_debug(5, "Waiting for start of NMEA sentence, ignoring 0x%02x\n", (unsigned char) ch);
 	}
-	str[i] = 0;
+	if (!run_forever) {
+		return -1;
+	}
 
-	return i;
+	for (i = 1; i < buflen - 1; i++) {
+		if (!run_forever) {
+			return -1;
+		}
+		ch = getserialchar(fd);
+		if (ch < 1) {
+			buf[i] = '\0';
+			return ch;
+		}
+		if (ch < ' ') {
+			break;
+		}
+		buf[i] = (char) ch;
+	}
+	if (!run_forever) {
+		return -1;
+	}
+	buf[i] = '\0';
+
+	return (int) i;
 }
 
 /*!
@@ -478,7 +517,7 @@ static void *aprs_connection_thread(void *data)
 
 	if (!(cfg = ast_config_load(config, zeroflag))) {
 		ast_log(LOG_NOTICE, "Unable to load config %s\n", config);
-		pthread_exit(NULL);
+		return NULL;
 	}
 	val = ast_variable_retrieve(cfg, "general", "call");
 	if (val) {
@@ -497,7 +536,7 @@ static void *aprs_connection_thread(void *data)
 	/* Verify that we have a callsign and password */
 	if ((!call) || (!password)) {
 		ast_log(LOG_ERROR, "You must specify call and password\n");
-		pthread_exit(NULL);
+		return NULL;
 	}
 
 	while (run_forever) {
@@ -709,8 +748,7 @@ static int report_aprs(const char *ctg, char *lat, char *lon, const char *elev)
 
 	/* Setup optional elevation */
 	elev_f = 0;
-	sscanf(elev, "%f", &elev_f);
-	if (elev_f > 0) {
+	if (sscanf(elev, "%f", &elev_f) == 1) {
 		snprintf(elev_str, sizeof(elev_str), "/A=%06.0f", elev_f * 3.28);
 	} else {
 		elev_str[0] = '\0';
@@ -889,6 +927,390 @@ static void lon_decimal_to_DMS(float dec, char *value, int len)
 }
 
 /*!
+ * \brief Extract a float JSON field value from a gpsd line.
+ *
+ * \param pattern Field match string, typically from JSON_KEY().
+ */
+static int gpsd_json_get_float(const char *json, const char *pattern, float *out)
+{
+	const char *p;
+
+	p = strstr(json, pattern);
+	if (!p) {
+		return -1;
+	}
+	p += strlen(pattern);
+	while (*p == ' ') {
+		p++;
+	}
+	if (!strncmp(p, "null", 4)) {
+		return -1;
+	}
+	*out = strtof(p, NULL);
+	return 0;
+}
+
+/*!
+ * \brief Extract an integer JSON field value from a gpsd line.
+ *
+ * \param pattern Field match string, typically from JSON_KEY().
+ */
+static int gpsd_json_get_int(const char *json, const char *pattern, int *out)
+{
+	float value;
+
+	if (gpsd_json_get_float(json, pattern, &value)) {
+		return -1;
+	}
+	*out = (int) value;
+	return 0;
+}
+
+/*!
+ * \brief Store a validated GPS position in the global structure.
+ */
+static void gps_position_update(float lat, float lon, float elev_m)
+{
+	char elevation[25];
+	time_t now_mono = time_monotonic();
+
+	snprintf(elevation, sizeof(elevation), "%.1fM", elev_m);
+
+	ast_mutex_lock(&position_update_lock);
+	current_gps_position.is_valid = 1;
+	lat_decimal_to_DMS(lat, current_gps_position.latitude, sizeof(current_gps_position.latitude));
+	lon_decimal_to_DMS(lon, current_gps_position.longitude, sizeof(current_gps_position.longitude));
+	ast_copy_string(current_gps_position.elevation, elevation, sizeof(current_gps_position.elevation));
+	current_gps_position.last_updated = time(NULL);
+	current_gps_position.last_updated_mono = now_mono;
+	ast_mutex_unlock(&position_update_lock);
+
+	if (gps_unlock_shown) {
+		ast_log(LOG_NOTICE, "GPS locked\n");
+		gps_unlock_shown = 0;
+	}
+
+	ast_debug(5, "Got latitude: %s, longitude: %s, elevation: %s from: gpsd\n", current_gps_position.latitude,
+		current_gps_position.longitude, current_gps_position.elevation);
+}
+
+/*!
+ * \brief Read one newline-terminated line from a socket.
+ *
+ * Characters beyond \a len are discarded until the terminating newline.
+ */
+static int gpsd_read_line(int fd, char *buf, size_t len)
+{
+	size_t i = 0;
+	ssize_t res;
+	char c;
+
+	if (len < 2) {
+		return -1;
+	}
+
+	while (run_forever) {
+		res = read(fd, &c, 1);
+		if (res < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+		if (res == 0) {
+			return -1;
+		}
+		if (c == '\n') {
+			buf[i] = '\0';
+			return (int) i;
+		}
+		if (c != '\r' && i < len - 1) {
+			buf[i++] = c;
+		}
+	}
+
+	return -1;
+}
+
+/*!
+ * \brief Connect to gpsd and enable JSON watch mode.
+ */
+static int gpsd_open(void)
+{
+	int fd;
+	struct ast_sockaddr addr = { { 0 } };
+	static const char watchcmd[] = "?WATCH={\"enable\":true,\"json\":true}\n";
+	ssize_t wrote;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		ast_log(LOG_WARNING, "Cannot open gpsd socket: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (ast_sockaddr_resolve_first_af(&addr, gpsd_host, PARSE_PORT_IGNORE, AST_AF_INET)) {
+		ast_log(LOG_WARNING, "gpsd host %s cannot be resolved\n", gpsd_host);
+		close(fd);
+		return -1;
+	}
+	ast_sockaddr_set_port(&addr, gpsd_port);
+
+	if (ast_connect(fd, &addr) < 0) {
+		ast_log(LOG_WARNING, "Cannot connect to gpsd at %s:%d: %s\n", gpsd_host, gpsd_port, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	wrote = write(fd, watchcmd, sizeof(watchcmd) - 1);
+	if (wrote < 0) {
+		ast_log(LOG_WARNING, "Cannot enable gpsd JSON watch on %s:%d: %s\n", gpsd_host, gpsd_port, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	if (wrote != (ssize_t) (sizeof(watchcmd) - 1)) {
+		ast_log(LOG_WARNING, "Incomplete gpsd JSON watch on %s:%d\n", gpsd_host, gpsd_port);
+		close(fd);
+		return -1;
+	}
+
+	gpsd_sockfd = fd;
+	ast_log(LOG_NOTICE, "GPS connected via gpsd at %s:%d\n", gpsd_host, gpsd_port);
+	return fd;
+}
+
+/*!
+ * \brief Parse a gpsd TPV JSON line and update position when fixed.
+ */
+static void gpsd_handle_tpv(const char *line)
+{
+	int mode = 0;
+	float lat = 0.0, lon = 0.0, elev = 0.0;
+
+	if (!strstr(line, JSON_KEY(class) "\"TPV\"") && !strstr(line, JSON_KEY(class) " \"TPV\"")) {
+		return;
+	}
+
+	if (gpsd_json_get_int(line, JSON_KEY(mode), &mode) || mode < 2) {
+		if (!gps_unlock_shown) {
+			ast_log(LOG_WARNING, "GPS data not available (signal not locked)\n");
+			gps_unlock_shown = 1;
+		}
+		ast_mutex_lock(&position_update_lock);
+		current_gps_position.is_valid = 0;
+		ast_mutex_unlock(&position_update_lock);
+		return;
+	}
+
+	if (gpsd_json_get_float(line, JSON_KEY(lat), &lat) || gpsd_json_get_float(line, JSON_KEY(lon), &lon)) {
+		ast_debug(1, "GPS ignoring incomplete gpsd TPV: %s\n", line);
+		return;
+	}
+
+	if (gpsd_json_get_float(line, JSON_KEY(altMSL), &elev)) {
+		gpsd_json_get_float(line, JSON_KEY(alt), &elev);
+	}
+
+	gps_position_update(lat, lon, elev);
+}
+
+/*!
+ * \brief gpsd processing thread.
+ */
+static void *gpsd_reader(void *data)
+{
+	char buf[2048];
+	int fd = -1;
+	struct pollfd fds[1];
+
+	while (run_forever) {
+		if (fd < 0) {
+			fd = gpsd_open();
+			if (fd < 0) {
+				ast_mutex_lock(&position_update_lock);
+				current_gps_position.is_valid = 0;
+				ast_mutex_unlock(&position_update_lock);
+				sleep(2);
+				continue;
+			}
+		}
+
+		memset(&fds, 0, sizeof(fds));
+		fds[0].fd = fd;
+		fds[0].events = POLLIN;
+
+		if (ast_poll(fds, 1, 1000) < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			ast_log(LOG_WARNING, "GPS gpsd poll error on %s:%d, reconnecting\n", gpsd_host, gpsd_port);
+			close(fd);
+			fd = -1;
+			gpsd_sockfd = -1;
+			ast_mutex_lock(&position_update_lock);
+			current_gps_position.is_valid = 0;
+			ast_mutex_unlock(&position_update_lock);
+			sleep(1);
+			continue;
+		}
+
+		if (!(fds[0].revents & POLLIN)) {
+			time_t now_mono = time_monotonic();
+
+			ast_mutex_lock(&position_update_lock);
+			if (current_gps_position.last_updated_mono + GPS_VALID_SECS < now_mono) {
+				current_gps_position.is_valid = 0;
+			}
+			ast_mutex_unlock(&position_update_lock);
+			continue;
+		}
+
+		if (gpsd_read_line(fd, buf, sizeof(buf)) < 1) {
+			ast_log(LOG_WARNING, "GPS gpsd read error on %s:%d, reconnecting\n", gpsd_host, gpsd_port);
+			close(fd);
+			fd = -1;
+			gpsd_sockfd = -1;
+			ast_mutex_lock(&position_update_lock);
+			current_gps_position.is_valid = 0;
+			ast_mutex_unlock(&position_update_lock);
+			sleep(1);
+			continue;
+		}
+
+		gpsd_handle_tpv(buf);
+	}
+
+	if (fd != -1) {
+		close(fd);
+	}
+	gpsd_sockfd = -1;
+
+	ast_debug(2, "%s has exited\n", __FUNCTION__);
+	return NULL;
+}
+
+/*!
+ * \brief Format a default elevation string with a meters unit suffix.
+ */
+static void format_def_elevation(const char *defelev, char *elevation, size_t elen)
+{
+	if (defelev) {
+		float eleva;
+
+		eleva = strtof(defelev, NULL);
+		snprintf(elevation, elen, "%.1fM", eleva);
+	} else {
+		ast_copy_string(elevation, "000.0M", elen);
+	}
+}
+
+/*!
+ * \brief Test whether a sentence is an NMEA GGA fix record.
+ */
+static int is_gga_sentence(const char *sentence)
+{
+	size_t len;
+
+	if (ast_strlen_zero(sentence) || sentence[0] != '$') {
+		return 0;
+	}
+
+	len = strlen(sentence);
+	if (len != 6 || strcasecmp(sentence + 3, "GGA")) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/*!
+ * \brief Apply a hundredths-of-minute offset to an APRS-format latitude string.
+ *
+ * \retval 1 on success
+ * \retval 0 on parse failure
+ */
+static int aprs_lat_apply_offset(const char *in_lat, int hundredth_minute_offset, char *out_lat, size_t out_len)
+{
+	char latbuf[25]; /* scratch copy of DDMM.mmN/S before parsing */
+	char dir;
+	int deg;
+	size_t len;
+	double minutes, decimal;
+
+	if (ast_strlen_zero(in_lat) || strlen(in_lat) < 4) {
+		return 0;
+	}
+
+	ast_copy_string(latbuf, in_lat, sizeof(latbuf));
+	len = strlen(latbuf);
+	dir = latbuf[len - 1];
+	if (dir != 'N' && dir != 'S') {
+		return 0;
+	}
+	latbuf[len - 1] = '\0';
+
+	deg = (latbuf[0] - '0') * 10 + (latbuf[1] - '0');
+	minutes = strtod(latbuf + 2, NULL);
+	if (minutes < 0.0 || minutes >= 60.0) {
+		return 0;
+	}
+
+	decimal = (double) deg + minutes / 60.0;
+	if (dir == 'S') {
+		decimal = -decimal;
+	}
+	decimal += hundredth_minute_offset / 6000.0;
+
+	if (decimal >= 0.0) {
+		dir = 'N';
+	} else {
+		dir = 'S';
+		decimal = -decimal;
+	}
+
+	deg = (int) decimal;
+	minutes = (decimal - deg) * 60.0;
+	snprintf(out_lat, out_len, "%02d%05.2f%c", deg, minutes, dir);
+	return 1;
+}
+
+/*!
+ * \brief Open and configure the GPS serial port.
+ *
+ * \retval fd on success
+ * \retval -1 on failure
+ */
+static int gps_serial_open(void)
+{
+	int fd;
+	struct termios mode;
+
+	fd = open(comport, O_RDWR);
+	if (fd == -1) {
+		ast_log(LOG_WARNING, "Cannot open serial port %s: %s\n", comport, strerror(errno));
+		return -1;
+	}
+
+	memset(&mode, 0, sizeof(mode));
+	if (tcgetattr(fd, &mode)) {
+		ast_log(LOG_WARNING, "Unable to get serial parameters on %s: %s\n", comport, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	cfmakeraw(&mode);
+
+	cfsetispeed(&mode, baudrate);
+	cfsetospeed(&mode, baudrate);
+	if (tcsetattr(fd, TCSANOW, &mode)) {
+		ast_log(LOG_WARNING, "Unable to set serial parameters on %s: %s\n", comport, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	usleep(100000);
+	return fd;
+}
+
+/*!
  * \brief GPS device processing thread.
  * This routine continuously reads and parses the serial GPS data.
  *
@@ -900,61 +1322,34 @@ static void lon_decimal_to_DMS(float dec, char *value, int len)
 static void *gps_reader(void *data)
 {
 	char buf[300], c, *strs[100];
-	int res, i, n, fd, has_comport = 0;
-	struct termios mode;
+	int res, i, n, fd, star_idx, rx_checksum;
 	struct position_info *selected_info;
 	time_t now_mono;
 
-	if (comport) {
-		has_comport = 1;
-	} else {
-		comport = "/dev/null";
-	}
-
-	/* Open the serial port configured for the GPS device */
-	fd = open(comport, O_RDWR);
-	if (fd == -1) {
-		ast_log(LOG_WARNING, "Cannot open serial port %s: %s\n", comport, strerror(errno));
-		goto err;
-	}
-
-	if (has_comport) {
-		memset(&mode, 0, sizeof(mode));
-		if (tcgetattr(fd, &mode)) {
-			ast_log(LOG_WARNING, "Unable to get serial parameters on %s: %s\n", comport, strerror(errno));
-			close(fd);
-			goto err;
-		}
-#ifndef SOLARIS
-		cfmakeraw(&mode);
-#else
-		mode.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-		mode.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-		mode.c_cflag &= ~(CSIZE | PARENB | CRTSCTS);
-		mode.c_cflag |= CS8;
-		mode.c_cc[VTIME] = 3;
-		mode.c_cc[VMIN] = 1;
-#endif
-
-		cfsetispeed(&mode, baudrate);
-		cfsetospeed(&mode, baudrate);
-		if (tcsetattr(fd, TCSANOW, &mode)) {
-			ast_log(LOG_WARNING, "Unable to set serial parameters on %s: %s\n", comport, strerror(errno));
-			close(fd);
-			goto err;
-		}
-	}
-
-	/* Give the device a few milliseconds to come on-line */
-	usleep(100000);
-
-	/*! \todo we need to deal with someone unplugging the device */
+	fd = -1;
 
 	while (run_forever) {
-		/* Read a line from the serial port */
-		res = getserialline(fd, buf, sizeof(buf) - 1);
+		if (fd < 0) {
+			fd = gps_serial_open();
+			if (fd < 0) {
+				ast_mutex_lock(&position_update_lock);
+				current_gps_position.is_valid = 0;
+				ast_mutex_unlock(&position_update_lock);
+				sleep(2);
+				continue;
+			}
+		}
+
+		/* Read a complete NMEA sentence from the serial port */
+		res = getnmea_line(fd, buf, sizeof(buf));
 		if (res < 0) {
-			ast_log(LOG_ERROR, "GPS fatal error!\n");
+			ast_log(LOG_WARNING, "GPS serial read error on %s, reconnecting\n", comport);
+			close(fd);
+			fd = -1;
+			ast_mutex_lock(&position_update_lock);
+			current_gps_position.is_valid = 0;
+			ast_mutex_unlock(&position_update_lock);
+			sleep(1);
 			continue;
 		}
 		if (!res) {
@@ -984,7 +1379,7 @@ static void *gps_reader(void *data)
 			}
 			/* Validate the GPS data */
 			if (buf[0] != '$') {
-				ast_log(LOG_WARNING, "GPS Invalid data format (no '$' at beginning)\n");
+				ast_debug(1, "GPS reader lost NMEA framing on %s\n", comport);
 				continue;
 			}
 			/* Calculate the check sum */
@@ -995,12 +1390,13 @@ static void *gps_reader(void *data)
 				}
 				c ^= buf[i];
 			}
-			if ((!buf[i]) || (strlen(buf) < (i + 3))) {
-				ast_log(LOG_WARNING, "GPS Invalid data format (checksum format)\n");
+			star_idx = i;
+			if ((!buf[star_idx]) || (strlen(buf) < (star_idx + 3))) {
+				ast_debug(1, "GPS ignoring truncated NMEA sentence: %s\n", buf);
 				continue;
 			}
-			if ((sscanf(buf + i + 1, "%x", &i) != 1) || (c != i)) {
-				ast_log(LOG_WARNING, "GPS Invalid checksum\n");
+			if ((sscanf(buf + star_idx + 1, "%x", &rx_checksum) != 1) || (c != rx_checksum)) {
+				ast_debug(1, "GPS ignoring NMEA sentence with bad checksum: %s\n", buf);
 				continue;
 			}
 
@@ -1009,8 +1405,8 @@ static void *gps_reader(void *data)
 				ast_log(LOG_WARNING, "GPS Invalid data format (no data)\n");
 				continue;
 			}
-			/* We only process the $GPGGA sentence */
-			if (strcasecmp(strs[0], "$GPGGA")) {
+			/* Process NMEA GGA sentences ($GPGGA, $GNGGA, etc.) */
+			if (!is_gga_sentence(strs[0])) {
 				continue;
 			}
 			if (n != 15) {
@@ -1052,7 +1448,6 @@ static void *gps_reader(void *data)
 		close(fd);
 	}
 
-err:
 	ast_debug(2, "%s has exited\n", __FUNCTION__);
 	return NULL;
 }
@@ -1087,7 +1482,7 @@ static void *aprs_sender_thread(void *data)
 
 	if (!(cfg = ast_config_load(config, zeroflag))) {
 		ast_log(LOG_NOTICE, "Unable to load config %s\n", config);
-		pthread_exit(NULL);
+		return NULL;
 	}
 	val = ast_variable_retrieve(cfg, ctg, "lat");
 	if (val) {
@@ -1133,15 +1528,7 @@ static void *aprs_sender_thread(void *data)
 		this_def_position.is_valid = 1;
 		lat_decimal_to_DMS(strtof(deflat, NULL), this_def_position.latitude, sizeof(this_def_position.latitude));
 		lon_decimal_to_DMS(strtof(deflon, NULL), this_def_position.longitude, sizeof(this_def_position.longitude));
-		/* See if we have a default elevation */
-		if (defelev) {
-			float eleva, elevd;
-			eleva = strtof(defelev, NULL);
-			elevd = (eleva - floor(eleva)) * 10 + 0.5;
-			snprintf(this_def_position.elevation, sizeof(this_def_position.elevation), "%03d.%1d", (int) eleva, (int) elevd);
-		} else {
-			strcpy(this_def_position.elevation, "000.0");
-		}
+		format_def_elevation(defelev, this_def_position.elevation, sizeof(this_def_position.elevation));
 	}
 
 	memset(&selected_position, 0, sizeof(selected_position));
@@ -1195,8 +1582,8 @@ static void *aprstt_sender_thread(void *data)
 {
 	struct ast_config *cfg = NULL;
 	struct ast_flags zeroflag = { 0 };
-	int i, j, ttlist, ttoffset, ttslot, myoffset;
-	char *ctg, c;
+	int i, ttlist, ttoffset, ttslot, myoffset;
+	char *ctg;
 	char *deflat, *deflon, *defelev, ttsplit, *ttlat, *ttlon;
 	const char *val, *resolved_lat, *resolved_lon;
 	char fname[200], lat[25], theircall[20], overlay;
@@ -1216,7 +1603,7 @@ static void *aprstt_sender_thread(void *data)
 	/* Load our configuration */
 	if (!(cfg = ast_config_load(config, zeroflag))) {
 		ast_log(LOG_NOTICE, "Unable to load config %s\n", config);
-		pthread_exit(NULL);
+		return NULL;
 	}
 	val = ast_variable_retrieve(cfg, ctg, "lat");
 	if (val) {
@@ -1287,21 +1674,18 @@ static void *aprstt_sender_thread(void *data)
 		this_def_position.is_valid = 1;
 		lat_decimal_to_DMS(strtof(resolved_lat, NULL), this_def_position.latitude, sizeof(this_def_position.latitude));
 		lon_decimal_to_DMS(strtof(resolved_lon, NULL), this_def_position.longitude, sizeof(this_def_position.longitude));
-		/* See if we have a default elevation */
-		if (defelev) {
-			float eleva, elevd;
-			eleva = strtof(defelev, NULL);
-			elevd = (eleva - floor(eleva)) * 10 + 0.5;
-			snprintf(this_def_position.elevation, sizeof(this_def_position.elevation), "%03d.%1d", (int) eleva, (int) elevd);
-		} else {
-			strcpy(this_def_position.elevation, "000.0");
-		}
+		format_def_elevation(defelev, this_def_position.elevation, sizeof(this_def_position.elevation));
 	}
 
 	/*
 	 * Open the common block file for this section.
 	 * We will store the callsign and last update time.
 	 */
+	if (ttlist <= 0) {
+		ast_log(LOG_ERROR, "APRStt ttlist must be greater than zero\n");
+		return NULL;
+	}
+
 	mfp = NULL;
 	if (!strcmp(sender_entry->section, "general")) {
 		strcpy(fname, TT_COMMON);
@@ -1312,55 +1696,57 @@ static void *aprstt_sender_thread(void *data)
 		mfp = fopen(fname, "w");
 		if (!mfp) {
 			ast_log(LOG_ERROR, "Can not create aprstt common block file %s: %s\n", fname, strerror(errno));
-			pthread_exit(NULL);
+			return NULL;
 		}
 		memset(&ttempty, 0, sizeof(ttempty));
 		for (i = 0; i < ttlist; i++) {
 			if (fwrite(&ttempty, 1, sizeof(ttempty), mfp) != sizeof(ttempty)) {
 				ast_log(LOG_ERROR, "Error initializing aprtss common block file %s: %s\n", fname, strerror(errno));
 				fclose(mfp);
-				pthread_exit(NULL);
+				return NULL;
 			}
 		}
 		fclose(mfp);
 		if (stat(fname, &mystat) == -1) {
 			ast_log(LOG_ERROR, "Unable to stat new aprstt common block file %s: %s\n", fname, strerror(errno));
-			pthread_exit(NULL);
+			return NULL;
 		}
 	}
 	if (mystat.st_size < (sizeof(struct ttentry) * ttlist)) {
 		mfp = fopen(fname, "r+");
 		if (!mfp) {
 			ast_log(LOG_ERROR, "Can not open aprstt common block file %s: %s\n", fname, strerror(errno));
-			pthread_exit(NULL);
+			return NULL;
 		}
 		memset(&ttempty, 0, sizeof(ttempty));
 		if (fseek(mfp, 0, SEEK_END)) {
 			ast_log(LOG_ERROR, "Can not seek aprstt common block file %s: %s\n", fname, strerror(errno));
-			pthread_exit(NULL);
+			fclose(mfp);
+			return NULL;
 		}
 		for (i = mystat.st_size; i < (sizeof(struct ttentry) * ttlist); i += sizeof(struct ttentry)) {
 			if (fwrite(&ttempty, 1, sizeof(ttempty), mfp) != sizeof(ttempty)) {
 				ast_log(LOG_ERROR, "Error growing aprtss common block file %s: %s\n", fname, strerror(errno));
 				fclose(mfp);
-				pthread_exit(NULL);
+				return NULL;
 			}
 		}
 		fclose(mfp);
 		if (stat(fname, &mystat) == -1) {
 			ast_log(LOG_ERROR, "Unable to stat updated aprstt common block file %s: %s\n", fname, strerror(errno));
-			pthread_exit(NULL);
+			return NULL;
 		}
 	}
 	mfp = fopen(fname, "r+");
 	if (!mfp) {
 		ast_log(LOG_ERROR, "Can not open aprstt common block file %s: %s\n", fname, strerror(errno));
-		pthread_exit(NULL);
+		return NULL;
 	}
 	ttentries = mmap(NULL, mystat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(mfp), 0);
-	if (ttentries == NULL) {
+	if (ttentries == MAP_FAILED) {
 		ast_log(LOG_ERROR, "Cannot map aprtss common file %s: %s\n", fname, strerror(errno));
-		pthread_exit(NULL);
+		fclose(mfp);
+		return NULL;
 	}
 
 	while (run_forever) {
@@ -1446,26 +1832,13 @@ static void *aprstt_sender_thread(void *data)
 		ast_mutex_unlock(&position_update_lock);
 
 		if (selected_position.is_valid) {
-			if (sscanf(selected_position.latitude, "%d.%d%c", &i, &j, &c) == 3) {
-				/* Adjust the latitude for the offset */
-				if (c == 'S') {
-					i = -i;
-				}
-				if (i >= 0) {
-					j -= myoffset;
-				} else {
-					j += myoffset;
-				}
-				i += (j / 60);
-				if (j < 0) {
-					snprintf(lat, sizeof(lat), "%04d.%02d%c", (i >= 0) ? i : -i, -j % 60, (i >= 0) ? 'N' : 'S');
-				} else {
-					snprintf(lat, sizeof(lat), "%04d.%02d%c", (i >= 0) ? i : -i, j % 60, (i >= 0) ? 'N' : 'S');
-				}
+			if (aprs_lat_apply_offset(selected_position.latitude, myoffset, lat, sizeof(lat))) {
 				/* If our last position update is good, send an update */
 				if ((selected_position.last_updated + GPS_VALID_SECS) >= now) {
 					report_aprstt(ctg, lat, selected_position.longitude, theircall, overlay);
 				}
+			} else {
+				ast_debug(2, "APRS_SENDTT: unable to apply latitude offset to '%s'\n", selected_position.latitude);
 			}
 		}
 	}
@@ -1635,8 +2008,19 @@ static char *handle_cli_status(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	}
 
 	ast_mutex_lock(&position_update_lock);
-	ast_cli(a->fd, "GPS: %s, Signal: %s \n", ast_strlen_zero(comport) ? "Disconnected" : "Connected",
-		current_gps_position.is_valid ? "Locked" : "Unlocked");
+	switch (gps_source) {
+	case GPS_SOURCE_GPSD:
+		ast_cli(a->fd, "GPS: Connected via gpsd %s:%d, Signal: %s \n", gpsd_host, gpsd_port,
+			current_gps_position.is_valid ? "Locked" : "Unlocked");
+		break;
+	case GPS_SOURCE_SERIAL:
+		ast_cli(a->fd, "GPS: Connected, Signal: %s \n", current_gps_position.is_valid ? "Locked" : "Unlocked");
+		break;
+	case GPS_SOURCE_NONE:
+	default:
+		ast_cli(a->fd, "GPS: Disconnected, Signal: %s \n", current_gps_position.is_valid ? "Locked" : "Unlocked");
+		break;
+	}
 	if (current_gps_position.is_valid) {
 		ast_cli(a->fd, "Position: %s %s Elevation: %s\n", current_gps_position.latitude, current_gps_position.longitude,
 			current_gps_position.elevation);
@@ -1665,14 +2049,25 @@ static int unload_module(void)
 	if (sockfd != -1) {
 		shutdown(sockfd, SHUT_RDWR);
 	}
+	if (gpsd_sockfd != -1) {
+		shutdown(gpsd_sockfd, SHUT_RDWR);
+	}
 	ast_debug(2, "Waiting for aprs_connection_thread to exit\n");
 	pthread_join(aprs_connection_thread_id, NULL);
 
-	if (comport) {
+	if (gps_source != GPS_SOURCE_NONE) {
 		ast_debug(2, "Waiting for gps_reader_thread to exit\n");
 		pthread_join(gps_reader_thread_id, NULL);
-		ast_free(comport);
 	}
+	if (comport) {
+		ast_free(comport);
+		comport = NULL;
+	}
+	if (gpsd_host) {
+		ast_free(gpsd_host);
+		gpsd_host = NULL;
+	}
+	gps_source = GPS_SOURCE_NONE;
 
 	/* Shutdown and clean up sender threads */
 	AST_RWLIST_WRLOCK(&aprs_sender_list);
@@ -1715,6 +2110,8 @@ static int load_module(void)
 
 	struct ast_flags zeroflag = { 0 };
 
+	run_forever = 1;
+
 	if (!(cfg = ast_config_load(config, zeroflag))) {
 		ast_log(LOG_NOTICE, "Unable to load config %s\n", config);
 		return AST_MODULE_LOAD_DECLINE;
@@ -1724,6 +2121,35 @@ static int load_module(void)
 		comport = ast_strdup(val);
 	} else {
 		comport = NULL;
+	}
+	val = ast_variable_retrieve(cfg, "general", "gpsd_host");
+	if (val && !ast_strlen_zero(val)) {
+		gpsd_host = ast_strdup(val);
+	}
+	val = ast_variable_retrieve(cfg, "general", "gpsd_port");
+	if (val && !ast_strlen_zero(val)) {
+		char *endptr = NULL;
+		long port_num;
+
+		errno = 0;
+		port_num = strtol(val, &endptr, 10);
+		if (errno || endptr == val || *endptr || port_num <= 0 || port_num > GPS_MAX_GPSD_PORT) {
+			ast_log(LOG_ERROR, "gpsd_port %s is not valid, using %d\n", val, GPS_DEFAULT_GPSD_PORT);
+			gpsd_port = GPS_DEFAULT_GPSD_PORT;
+		} else {
+			gpsd_port = (int) port_num;
+		}
+	}
+	/* Select a single GPS source after both options have been parsed. */
+	if (gpsd_host) {
+		gps_source = GPS_SOURCE_GPSD;
+		if (comport) {
+			ast_log(LOG_NOTICE, "gpsd_host configured; ignoring comport %s\n", comport);
+			ast_free(comport);
+			comport = NULL;
+		}
+	} else if (comport) {
+		gps_source = GPS_SOURCE_SERIAL;
 	}
 	val = ast_variable_retrieve(cfg, "general", "lat");
 	if (val) {
@@ -1777,7 +2203,8 @@ static int load_module(void)
 			baudrate = B57600;
 			break;
 		default:
-			ast_log(LOG_ERROR, "%s is not valid baud rate for iospeed\n", val);
+			ast_log(LOG_ERROR, "%s is not a supported baud rate, using %d\n", val, 4800);
+			baudrate = GPS_DEFAULT_BAUDRATE;
 			break;
 		}
 	} else {
@@ -1792,15 +2219,7 @@ static int load_module(void)
 		general_def_position.is_valid = 1;
 		lat_decimal_to_DMS(strtof(def_lat, NULL), general_def_position.latitude, sizeof(general_def_position.latitude));
 		lon_decimal_to_DMS(strtof(def_lon, NULL), general_def_position.longitude, sizeof(general_def_position.longitude));
-		/* See if we have a default elevation */
-		if (def_elev) {
-			float eleva, elevd;
-			eleva = strtof(def_elev, NULL);
-			elevd = (eleva - floor(eleva)) * 10 + 0.5;
-			snprintf(general_def_position.elevation, sizeof(general_def_position.elevation), "%03d.%1dM", (int) eleva, (int) elevd);
-		} else {
-			strcpy(general_def_position.elevation, "000.0M");
-		}
+		format_def_elevation(def_elev, general_def_position.elevation, sizeof(general_def_position.elevation));
 	}
 
 	/* Create the aprs connection thread */
@@ -1809,10 +2228,12 @@ static int load_module(void)
 		ast_config_destroy(cfg);
 		return -1;
 	}
-	/* If we have a comport specified, start the GPS processing thread */
-	if (comport) {
-		if (ast_pthread_create(&gps_reader_thread_id, NULL, gps_reader, NULL)) {
-			ast_log(LOG_ERROR, "Cannot create APRS reader thread");
+	/* If we have a GPS source configured, start the GPS processing thread */
+	if (gps_source != GPS_SOURCE_NONE) {
+		void *(*reader)(void *) = (gps_source == GPS_SOURCE_GPSD) ? gpsd_reader : gps_reader;
+
+		if (ast_pthread_create(&gps_reader_thread_id, NULL, reader, NULL)) {
+			ast_log(LOG_ERROR, "Cannot create GPS reader thread");
 			ast_config_destroy(cfg);
 			return -1;
 		}
