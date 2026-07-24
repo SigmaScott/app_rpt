@@ -2547,6 +2547,7 @@ static void *attempt_reconnect(struct rpt *myrpt, struct rpt_link *l)
 	*tele++ = 0;
 	l->elaptime = 0;
 	l->connecttime = ast_tv(0, 0); /* not connected */
+	l->lastkeytime = 0;
 	l->thisconnected = 0;
 	l->linkmode = 0;
 	l->lastrx1 = 0;
@@ -2764,8 +2765,8 @@ static void local_dtmf_helper(struct rpt *myrpt, char c_in)
 
 static void queue_id(struct rpt *myrpt)
 {
-	if (myrpt->p.idtime) { /* ID time must be non-zero */
-		myrpt->mustid = myrpt->tailid = 0;
+	myrpt->mustid = myrpt->tailid = 0;
+	if (myrpt->p.idtime) {				  /* ID time must be non-zero */
 		myrpt->idtimer = myrpt->p.idtime; /* Reset our ID timer */
 		rpt_mutex_unlock(&myrpt->lock);
 		rpt_telemetry(myrpt, ID, NULL);
@@ -4366,6 +4367,19 @@ static inline int rxchannel_read(struct rpt *myrpt, const int lasttx)
 	return 0;
 }
 
+static inline int hangup_frame_helper(struct ast_channel *chan, const char *chantype, struct ast_frame *f)
+{
+	if (f->frametype == AST_FRAME_CONTROL) {
+		if (f->subclass.integer == AST_CONTROL_HANGUP) {
+			ast_debug(1, "%s (%s) received hangup frame\n", ast_channel_name(chan), chantype);
+			ast_frfree(f);
+			return -1;
+		}
+	}
+	ast_frfree(f);
+	return 0;
+}
+
 static inline int pchannel_read(struct rpt *myrpt)
 {
 	struct ast_frame *f = ast_read(myrpt->pchannel);
@@ -4382,26 +4396,7 @@ static inline int pchannel_read(struct rpt *myrpt)
 			ast_write(myrpt->txpchannel, f);
 		}
 	}
-	if (f->frametype == AST_FRAME_CONTROL) {
-		if (f->subclass.integer == AST_CONTROL_HANGUP) {
-			ast_debug(1, "@@@@ rpt:Hung Up\n");
-		}
-	}
-	ast_frfree(f);
-	return 0;
-}
-
-static inline int hangup_frame_helper(struct ast_channel *chan, const char *chantype, struct ast_frame *f)
-{
-	if (f->frametype == AST_FRAME_CONTROL) {
-		if (f->subclass.integer == AST_CONTROL_HANGUP) {
-			ast_debug(1, "%s (%s) received hangup frame\n", ast_channel_name(chan), chantype);
-			ast_frfree(f);
-			return -1;
-		}
-	}
-	ast_frfree(f);
-	return 0;
+	return hangup_frame_helper(myrpt->pchannel, "pchannel", f);
 }
 
 static inline int wait_for_hangup_helper(struct ast_channel *chan, const char *chantype)
@@ -4539,6 +4534,7 @@ static int remote_hangup_helper(struct rpt *myrpt, struct rpt_link *l)
 				l->retrytimer = RETRY_TIMER_MS;
 				l->elaptime = 0;
 				l->connecttime = ast_tv(0, 0); /* no longer connected */
+				l->lastkeytime = 0;
 				l->thisconnected = 0;
 				rpt_mutex_unlock(&myrpt->lock);
 				return 1;
@@ -4897,10 +4893,7 @@ void process_link_channel(struct rpt *myrpt, struct rpt_link *l)
 			if (f->frametype == AST_FRAME_CONTROL && f->subclass.integer == AST_CONTROL_HANGUP) {
 				ast_debug(1, "@@@@ rpt:Hung Up\n");
 				ast_frfree(f);
-				if (remote_hangup_helper(myrpt, l)) {
-					/* A reconnect is possible */
-					continue;
-				}
+				remote_hangup_helper(myrpt, l); /* A reconnect is never possible on pchan hangup */
 				break;
 			}
 			ast_frfree(f);
@@ -5272,7 +5265,7 @@ static void *rpt(void *this)
 	ast_autoservice_stop(myrpt->rxchannel);
 	while (ms >= 0) {
 		struct ast_channel *who;
-		struct ast_channel *cs[300], *cs1[300];
+		struct ast_channel *cs[8];
 		int totx = 0, elap = 0, n, x;
 		time_t t, t_mono;
 		struct rpt_link *l;
@@ -5367,8 +5360,12 @@ static void *rpt(void *this)
 			myrpt->localtx = myrpt->keyed; /* If sleep disabled, just copy keyed state to localrx */
 		}
 		/* Create a "must_id" flag for the cleanup ID */
-		if (myrpt->p.idtime) /* ID time must be non-zero */
-			myrpt->mustid |= (myrpt->idtimer) && (myrpt->keyed || myrpt->remrx);
+		if (myrpt->p.idtime) { /* ID time must be non-zero */
+			myrpt->mustid |= myrpt->idtimer && (myrpt->keyed || myrpt->remrx);
+		} else {
+			myrpt->mustid = 0;
+		}
+
 		if (myrpt->keyed || myrpt->remrx) {
 			/* Set the inactivity was keyed flag and reset its timer */
 			myrpt->rptinactwaskeyedflag = 1;
@@ -5607,10 +5604,11 @@ static void *rpt(void *this)
 		/* else if at ID time limit, do it right over the top of them */
 		/* If beaconing is enabled, always id when the timer expires */
 		/* Lastly, if the repeater has been keyed, and the ID timer is expired, do a clean up ID */
-		if (((myrpt->mustid) || (myrpt->p.beaconing)) && (!myrpt->idtimer))
+		if ((myrpt->mustid || myrpt->p.beaconing) && !myrpt->idtimer) {
 			queue_id(myrpt);
+		}
 
-		if ((myrpt->p.idtime && totx && (!myrpt->exttx) && (myrpt->idtimer <= myrpt->p.politeid) && myrpt->tailtimer)) { /* ID time must be non-zero */
+		if (myrpt->p.idtime && totx && !myrpt->exttx && (myrpt->idtimer <= myrpt->p.politeid) && myrpt->tailtimer) { /* ID time must be non-zero */
 			myrpt->tailid = 1;
 		}
 
@@ -5775,12 +5773,7 @@ static void *rpt(void *this)
 			myrpt->topkeystate = 3;
 		}
 		ms = MSWAIT;
-		for (x = 0; x < n; x++) {
-			int s = -(-x - myrpt->scram - 1) % n;
-			cs1[x] = cs[s];
-		}
-		myrpt->scram++;
-		who = ast_waitfor_n(cs1, n, &ms);
+		who = ast_waitfor_n(cs, n, &ms);
 		if (who == NULL) {
 			ms = 0;
 		}
@@ -5841,12 +5834,10 @@ static void *rpt(void *this)
 			if (rxchannel_read(myrpt, lasttx)) {
 				break;
 			}
-			continue;
 		} else if (who == myrpt->pchannel) { /* if it was a read from pseudo */
 			if (pchannel_read(myrpt)) {
 				break;
 			}
-			continue;
 		} else if (who == myrpt->rxpchannel) {
 			if (rxpchannel_read(myrpt)) {
 				break;
@@ -5855,12 +5846,10 @@ static void *rpt(void *this)
 			if (txchannel_read(myrpt)) {
 				break;
 			}
-			continue;
 		} else if (who == myrpt->localtxchannel) { /* if it was a read from local-tx */
 			if (localtxchannel_read(myrpt, &myfirst)) {
 				break;
 			}
-			continue;
 		} else if (who == myrpt->txpchannel) { /* if it was a read from remote tx */
 			if (txpchannel_read(myrpt)) {
 				break;

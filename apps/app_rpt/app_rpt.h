@@ -1,6 +1,6 @@
 #define VERSION_MAJOR 3
-#define VERSION_MINOR 9
-#define VERSION_PATCH 3
+#define VERSION_MINOR 10
+#define VERSION_PATCH 0
 
 #include "asterisk/audiohook.h"
 
@@ -781,7 +781,6 @@ struct rpt {
 	char *txchanname;
 	rpt_bool remote:1;
 	char *remoterig;
-	unsigned int scram;
 #ifdef _MDC_DECODE_H_
 	mdc_decoder_t *mdc;
 #endif

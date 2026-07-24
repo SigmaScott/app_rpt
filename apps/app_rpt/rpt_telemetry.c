@@ -3451,7 +3451,7 @@ treataslocal:
 	}
 #endif
 	myrpt->noduck = 0;
-	pthread_exit(NULL);
+	return NULL;
 abort:
 	telem_done(myrpt, mytele);
 abort2:
@@ -3471,7 +3471,7 @@ abort3:
 		ast_channel_unref(mychannel);
 	}
 
-	pthread_exit(NULL);
+	return NULL;
 }
 
 static const char *rpt_tele_mode_str(enum rpt_tele_mode mode)
@@ -3778,6 +3778,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 
 			lbuf = ast_str_create(RPT_AST_STR_INIT_SIZE);
 			if (!lbuf) {
+				rpt_mutex_unlock(&myrpt->lock);
 				return;
 			}
 
@@ -3848,6 +3849,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 			strs = ast_malloc(n * sizeof(char *));
 			if (!strs) {
 				ast_free(lbuf);
+				ast_free(lbuf2);
 				return;
 			}
 			ns = finddelim(ast_str_buffer(lbuf), strs, n);
