@@ -117,7 +117,7 @@ time period (the first 160 samples of the abstracted buffer (which is the physic
 drainindex + 159) and whichever one, if any that has the largest RSSI average greater then zero is selected
 as the audio source for that frame. The corresponding audio buffer's contents (in the corresponding offsets)
 are presented to Asterisk, then ALL the clients corresponding RSSI data is set to 0, ALL the clients corresponding
-audio is set to quiet (0x7f). The overwriting of the buffers after their use/examination is done so that the
+audio is set to quiet (0xff). The overwriting of the buffers after their use/examination is done so that the
 next time those positions in the physical buffer are examined, they will not contain any data that was not actually
 put there, since all client's buffers are significant regardless of whether they were populated or not. This
 allows for the true 'connectionless-ness' of this protocol implementation.
@@ -310,6 +310,9 @@ Use "core show help voter <command>"" to display usage.
 #include <fnmatch.h>
 #include <math.h>
 
+#include "asterisk/res_usbradio.h"
+#include "asterisk/rpt_chan_shared.h"
+
 #include "asterisk/lock.h"
 #include "asterisk/channel.h"
 #include "asterisk/config.h"
@@ -328,13 +331,15 @@ Use "core show help voter <command>"" to display usage.
 #include "asterisk/format_cache.h"
 #include "asterisk/format_compatibility.h"
 #include "asterisk/timing.h"
-#include "asterisk/rpt_chan_shared.h"
 #include "../apps/app_rpt/pocsag.c"
 
 /* This array is used by the voter tune CLI command to send a 1kHz tone at
  * full system deviation to all clients (with transmit enabled) in an instance.
  */
 static unsigned char ulaw_digital_milliwatt[8] = { 0x1e, 0x0b, 0x0b, 0x1e, 0x9e, 0x8b, 0x8b, 0x9e };
+
+/* ulaw silence is represented as a 0xff byte */
+#define ULAW_SILENCE 0xff
 
 struct ast_flags zeroflag = { 0 };
 
@@ -349,7 +354,7 @@ char challenge[VOTER_CHALLENGE_LEN];
 char password[VOTER_PASSWORD_LEN];
 char context[100];
 
-/* Timeout definitions in ms*/
+/* Timeout definitions in ms */
 #define RX_TIMEOUT_MS 200
 #define CLIENT_TIMEOUT_MS 3000
 #define MASTER_TIMEOUT_MS 100
@@ -854,21 +859,25 @@ static int finddelim(char *str, char *strp[], size_t limit)
 }
 
 /*!
- * \brief Determine difference in two timevals in milliseconds.
+ * \brief Determine difference between the start time (starttime) and end time (endtime), in milliseconds.
  *
- * \param x				First timeval.
- * \param y				Second timeval.
- * \return      		Difference in milliseconds.
+ * If time has advanced (endtime is later than starttime), the difference is returned in positive milliseconds.
+ * If the times are equal, 0 is returned.
+ * If the endtime is earlier than the starttime, INT32_MAX is returned.
+ *
+ * \param endtime				Ending timeval reference to compare to starting timeval.
+ * \param starttime				Starting timeval reference.
+ * \return      				Difference in milliseconds.
  */
-static unsigned int voter_tvdiff_ms(const struct timeval x, const struct timeval y)
+static unsigned int voter_tvdiff_ms(const struct timeval endtime, const struct timeval starttime)
 {
-	int i;
+	int timediffms;
 
-	i = ast_tvdiff_ms(x, y);
-	if (i < 0) {
-		i = INT32_MAX;
+	timediffms = ast_tvdiff_ms(endtime, starttime);
+	if (timediffms < 0) {
+		timediffms = INT32_MAX;
 	}
-	return i;
+	return timediffms;
 }
 
 /*!
@@ -2047,7 +2056,7 @@ static char *handle_cli_tune(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 }
 
 /*!
- * \brief See if the ping request has completed.
+ * \brief Print the ping statistics when the ping test to a client has completed.
  *
  * This used in conjunction with the CLI "voter ping" command. It will print the results of the ping test.
  *
@@ -2055,16 +2064,20 @@ static char *handle_cli_tune(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
  */
 static void check_ping_done(struct voter_client *client)
 {
-	float p, q;
+	float pktsrcvd, avgtime;
 
+	/* If no pings were requested (client->pings_requested is 0), just return. */
 	if (!client->pings_requested) {
 		return;
 	}
 	if (!client->ping_abort) {
+		/* If we haven't sent all the requested pings yet, return to keep going. */
 		if (client->pings_sent < client->pings_requested) {
 			return;
 		}
-		if (voter_tvdiff_ms(ast_tvnow(), (ast_tvzero(client->ping_last_rxtime)) ? client->ping_txtime : client->ping_last_rxtime) > PING_TIMEOUT_MS) {
+		/* Check if the ping timed out, and log if it did. Otherwise, keep going. */
+		if (voter_tvdiff_ms(ast_radio_tvnow(),
+				(ast_tvzero(client->ping_last_rxtime)) ? client->ping_txtime : client->ping_last_rxtime) > PING_TIMEOUT_MS) {
 			ast_log(LOG_WARNING, "\nPING (%s): RESPONSE TIMEOUT!!\n", client->name);
 		} else {
 			if (client->pings_received < client->pings_requested) {
@@ -2072,28 +2085,36 @@ static void check_ping_done(struct voter_client *client)
 			}
 		}
 	} else {
-		ast_log(LOG_WARNING, "\nPING (%s): ABORTED!!\n", client->name);
+		ast_verb(1, "\nPING (%s): ABORTED!!\n", client->name);
 		client->ping_abort = 0;
 	}
+	/* Calculate the percentage of packets returned. pktsrcvd will be 100.0 if we got everything back.
+	 * If we got less than 100.0% packets back, we can calculate the packet loss.
+	 */
 	if (client->pings_sent) {
-		p = 100.0 * (float) (client->pings_received - client->pings_oos) / (float) client->pings_sent;
+		pktsrcvd = 100.0 * (float) (client->pings_received - client->pings_oos) / (float) client->pings_sent;
 	} else {
-		p = 0.0;
+		pktsrcvd = 0.0;
 	}
+	/* Calculate the average ping time of the received packets. */
 	if (client->pings_received) {
-		q = (float) client->pings_total_ms / (float) client->pings_received;
+		avgtime = (float) client->pings_total_ms / (float) client->pings_received;
 	} else {
-		q = 0;
+		avgtime = 0;
 	}
 	ast_verb(1, "\nPING (%s): Packets tx: %d, rx: %d, oos: %d, Avg.: %0.3f ms\n", client->name, client->pings_sent,
-		client->pings_received, client->pings_oos, q);
+		client->pings_received, client->pings_oos, avgtime);
 	ast_verb(1, "PING (%s): Worst: %d ms, Best: %d ms, %0.1f%% Packets successfully received (%0.1f%% loss)\n", client->name,
-		client->pings_worst, client->pings_best, p, 100.0 - p);
+		client->pings_worst, client->pings_best, pktsrcvd, 100.0 - pktsrcvd);
 	client->pings_requested = 0;
 }
 
 /*!
  * \brief Handle the Asterisk CLI "voter ping" request to start or stop a ping sequence for a named VOTER client.
+ *
+ * voter ping will default to sending 8 pings to a client, if the number of pings is not specified. If the number
+ * of pings is specified as 0, the ping sequence will be aborted. If a ping sequence is already in progress for a client,
+ * a new ping sequence will not be started until the previous one has completed.
  *
  * \param fd   			Asterisk CLI file descriptor used for command output.
  * \param argc 			Number of CLI arguments.
@@ -2105,40 +2126,62 @@ static void check_ping_done(struct voter_client *client)
 static int voter_do_ping(int fd, int argc, const char *const *argv)
 {
 	struct voter_client *client;
-	int npings = 8;
+	int npings = 8; /* Default to 8 pings if none are specified */
 
+	/* If there aren't enough arguments provided, show the command usage. */
 	if (argc < 3) {
 		return RESULT_SHOWUSAGE;
 	}
 
+	ast_mutex_lock(&voter_lock);
+	/* Traverse the client list to find the matching client provided in argv[2]. */
 	for (client = clients; client; client = client->next) {
+		/* Skip clients connected via proxy. */
 		if (IS_CLIENT_PROXY(client)) {
 			continue;
 		}
+		/* Skip clients that aren't connected. */
 		if (!client->heardfrom) {
 			continue;
 		}
+		/* Skip clients that aren't authenticated. */
 		if (!client->respdigest) {
 			continue;
 		}
+		/* Stop when we find a matching client (remember strcasecmp returns 0 on a match). */
 		if (!strcasecmp(client->name, argv[2])) {
 			break;
 		}
 	}
+	/* If we didn't find a matching client, say so and we're done. */
 	if (!client) {
 		ast_cli(fd, "VOTER client %s not found or not connected\n", argv[2]);
+		ast_mutex_unlock(&voter_lock);
 		return RESULT_SUCCESS;
 	}
+	/* If we received a specified ping count, use it. */
 	if (argc > 3) {
 		npings = atoi(argv[3]);
 	}
-	if (npings <= 0) {
-		client->ping_abort = 1;
-		return RESULT_SUCCESS;
-	} else if ((client->pings_requested) && (client->pings_sent < client->pings_requested)) {
+	/* If the number of pings is 0 or less, abort the ping test. If there is already
+	 * a ping test in progress to this client, throw a notice.
+	 */
+	if (argc > 3) {
+		if (atoi(argv[3]) <= 0) {
+			client->ping_abort = 1;
+			ast_mutex_unlock(&voter_lock);
+			return RESULT_SUCCESS;
+		} else {
+			npings = atoi(argv[3]);
+		}
+	}
+	/* If we are already pinging, ignore the new value. */
+	if ((client->pings_requested) && (client->pings_sent < client->pings_requested)) {
 		ast_cli(fd, "VOTER client %s already pinging!!\n", argv[2]);
+		ast_mutex_unlock(&voter_lock);
 		return RESULT_SUCCESS;
 	}
+	/* When we are done, clean up after ourselves. */
 	client->pings_sent = 0;
 	client->pings_received = 0;
 	client->pings_oos = 0;
@@ -2149,6 +2192,7 @@ static int voter_do_ping(int fd, int argc, const char *const *argv)
 	client->ping_seqno = 0;
 	client->ping_abort = 0;
 	client->pings_requested = npings;
+	ast_mutex_unlock(&voter_lock);
 	return RESULT_SUCCESS;
 }
 
@@ -2758,20 +2802,22 @@ static struct ast_cli_entry voter_cli[] = {
 /****************************END OF ASTERISK CLI FUNCTIONS****************************/
 
 /*!
- * \brief Mix and send audio packet. This function is only used for mix mode clients. Voting
- * clients use the voter_reader thread directly to send audio packets.
+ * \brief Mix and send audio packets. The voter_reader thread will call this function,
+ * sending us the audio and RSSI from the current selected voting client (if voting is used).
+ * This function then mixes the audio from all the clients that are receiving and selected,
+ * (including mix mode clients) and sends it to the Asterisk core.
  *
  * This routine must be called with voter_lock locked.
  *
- * \param p				Pointer to voter_pvt struct.
- * \param maxclient		Pointer to voter_client struct.
- * \param maxrssi		Maximum RSSI value.
- * \retval 0			Successful.
- * \retval 1			Successful.
+ * \param p				Pointer to the current voter instance (channel).
+ * \param maxclient		Pointer to the voted client (typically sent from voter_reader).
+ * \param maxrssi		Maximum RSSI value of the voted client (typically sent from voter_reader).
+ * \retval				0 if this function has an error or there was no audio/winner processed.
+ * \retval				1 if this function is successful.
  */
 static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclient, int maxrssi)
 {
-	int i, j, k, x, maxprio, haslastaudio;
+	int i, j, x, maxprio, haslastaudio, buffer_bytes_avail, rssi_sum;
 	struct ast_frame fr, *f1, *f2;
 	struct voter_client *client;
 	short silbuf[FRAME_SIZE];
@@ -2786,12 +2832,21 @@ static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclien
 	fr.offset = AST_FRIENDLY_OFFSET;
 	fr.src = __PRETTY_FUNCTION__;
 	f1 = ast_translate(p->toast, &fr, 0);
+	/* f1 now contains the voted-upon audio in slinear */
 	if (!f1) {
 		ast_log(LOG_ERROR, "VOTER %i: Can not translate frame to send to Asterisk\n", p->nodenum);
 		return 0;
 	}
+
+	/* Reset the priority value for mix mode clients, so we can see if any of them have
+	 * higher priority to send audio (below).
+	 */
 	maxprio = 0;
-	/* Traverse the client list and find the client with the highest priority. */
+	/* Traverse the client list and find the highest priority greater than 0 among eligible mix
+	 * clients to process.
+	 * If maxprio remains 0, all eligible clients will be processed.
+	 * If all eligible clients are tied at maxprio, they will be processed.
+	 */
 	for (client = clients; client; client = client->next) {
 		/* If the client doesn't belong to this VOTER instance, skip it. */
 		if (client->nodenum != p->nodenum) {
@@ -2824,7 +2879,7 @@ static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclien
 			maxprio = i;
 		}
 	}
-	/* f1 now contains the voted-upon audio in slinear */
+
 	for (client = clients; client; client = client->next) {
 		short *sp1, *sp2;
 		/* If the client doesn't belong to this VOTER instance, skip it. */
@@ -2860,44 +2915,57 @@ static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclien
 				continue;
 			}
 		}
-		/* At this point, we should have selected the client with the highest configured
+		/* At this point, we should have selected the mix client with the highest configured
 		 * priority (if there were any priorities configured). We will now proceed
 		 * to send the audio from this highest priority client.
 		 */
-		i = (int) client->buflen - ((int) client->drainindex + FRAME_SIZE);
-		if (i >= 0) {
+		/* Figure out where in the ring buffer we are.
+		 * If buffer_bytes_avail is positive, we still have data available to process, send the
+		 * audio to the Asterisk channel, and then replace it with silence.
+		 * If buffer_bytes_avail is negative, we have wrapped around the ring buffer. Get the
+		 * remaining bytes from the end of the buffer, and then get the rest from the beginning of the buffer.
+		 * After sending that audio to the Asterisk channel, replace it with silence.
+		 */
+		buffer_bytes_avail = client->buflen - (client->drainindex + FRAME_SIZE);
+		if (buffer_bytes_avail >= 0) {
+			/* Send the audio to the Asterisk channel, then replace it with silence. */
 			memcpy(p->buf + AST_FRIENDLY_OFFSET, client->audio + client->drainindex, FRAME_SIZE);
+			memset(client->audio + client->drainindex, ULAW_SILENCE, FRAME_SIZE);
 		} else {
-			memcpy(p->buf + AST_FRIENDLY_OFFSET, client->audio + client->drainindex, FRAME_SIZE + i);
-			memcpy(p->buf + AST_FRIENDLY_OFFSET + (client->buflen - i), client->audio, -i);
+			/* The buffer has wrapped, get the audio from the end of the buffer, and then get the rest from the beginning,
+			 * send it to the Asterisk channel, then replace it with silence.
+			 */
+			memcpy(p->buf + AST_FRIENDLY_OFFSET, client->audio + client->drainindex, FRAME_SIZE + buffer_bytes_avail);
+			memcpy(p->buf + AST_FRIENDLY_OFFSET + (FRAME_SIZE + buffer_bytes_avail), client->audio, -buffer_bytes_avail);
+			memset(client->audio + client->drainindex, ULAW_SILENCE, FRAME_SIZE + buffer_bytes_avail);
+			memset(client->audio, ULAW_SILENCE, -buffer_bytes_avail);
 		}
-		if (i >= 0) {
-			memset(client->audio + client->drainindex, 0xff, FRAME_SIZE);
-		} else {
-			memset(client->audio + client->drainindex, 0xff, FRAME_SIZE + i);
-			memset(client->audio, 0xff, -i);
-		}
+
 		/* Calculate the RSSI based on any RSSI samples in the buffer */
-		k = 0;
-		if (i >= 0) {
+		rssi_sum = 0;
+		if (buffer_bytes_avail >= 0) {
+			/* Get the RSSI samples from the buffer and sum them. Replace with 0 after reading. */
 			for (j = client->drainindex; j < client->drainindex + FRAME_SIZE; j++) {
-				k += client->rssi[j];
-				client->rssi[j] = 0; /* After reading an RSSI value, reset the array to 0 */
-			}
-		} else {
-			for (j = client->drainindex; j < client->drainindex + (FRAME_SIZE + i); j++) {
-				k += client->rssi[j];
+				rssi_sum += client->rssi[j];
 				client->rssi[j] = 0;
 			}
-			for (j = 0; j < -i; j++) {
-				k += client->rssi[j];
+		} else {
+			/* The buffer has wrapped, get the RSSI samples from the end of the buffer, and then get
+			 * the rest from the beginning, add them to the sum, and replace with 0 after reading.
+			 */
+			for (j = client->drainindex; j < client->drainindex + (FRAME_SIZE + buffer_bytes_avail); j++) {
+				rssi_sum += client->rssi[j];
+				client->rssi[j] = 0;
+			}
+			for (j = 0; j < -buffer_bytes_avail; j++) {
+				rssi_sum += client->rssi[j];
 				client->rssi[j] = 0;
 			}
 		}
 		/* Take the sum of all the RSSI samples we found, get the average, and set client->lastrssi
 		 * for this client based on the result.
 		 */
-		client->lastrssi = k / FRAME_SIZE;
+		client->lastrssi = rssi_sum / FRAME_SIZE;
 		/* If this client's RSSI is has the strongest RSSI, set maxrssi to this new value, and
 		 * mark this client as the strongest (maxclient).
 		 */
@@ -2941,9 +3009,11 @@ static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclien
 		}
 		ast_frfree(f2);
 	}
+	/* If this instance came from a proxy server, reset maxclient to NULL. */
 	if (p->priconn) {
 		maxclient = NULL;
 	}
+	/* Reset a bunch of stuff if maxclient is NULL. */
 	if (!maxclient) { /* If nothing there */
 		/*!
 		 * \todo p->owner probably shouldn't be NULL, in which case this should be made an assertion, once this issue is fixed.
@@ -2972,9 +3042,14 @@ static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclien
 		ast_frfree(f1);
 		return 0;
 	}
+	/* At this point, maxclient has been set to the strongest mix client, or the voted client
+	 * (maxclient) was sent to us from voter_reader. Update the VOTER instance state to reflect
+	 * the new winner, and queue the audio frame to Asterisk.
+	 */
 	p->winner = maxclient;
 	incr_drainindex(p);
-	gettimeofday(&p->lastrxtime, NULL);
+	p->lastrxtime = ast_radio_tvnow();
+	/* If the channel isn't keyed, tell Asterisk to key it. */
 	if (!p->rxkey) {
 		struct ast_frame fr = {
 			.frametype = AST_FRAME_CONTROL,
@@ -2984,17 +3059,22 @@ static int voter_mix_and_send(struct voter_pvt *p, struct voter_client *maxclien
 
 		ast_queue_frame(p->owner, &fr);
 	}
+	/* Assert the effective "COS". */
 	p->rxkey = 1;
 	x = 0;
 
+	/* Process any DTMF in the audio. */
 	if (p->dsp && p->usedtmf) {
-		struct ast_frame *f3 = ast_frdup(f1); /* dup f1: ast_dsp_process may mutate the input in place, and we still need f1 below */
-
+		/* Duplicate f1: ast_dsp_process may mutate the input in place, and we still need f1 below */
+		struct ast_frame *f3 = ast_frdup(f1);
 		if (!f3) {
 			ast_frfree(f1);
 			return 0;
 		}
 
+		/* Send the audio frame (f3) to Asterisk for DTMF processing. It will also mute the DTMF
+		 * tone from the audio as part of the processing. Return the result into f2.
+		 */
 		f2 = ast_dsp_process(NULL, p->dsp, f3);
 		if ((f2->frametype == AST_FRAME_DTMF_END) || (f2->frametype == AST_FRAME_DTMF_BEGIN)) {
 			if ((f2->subclass.integer != 'm') && (f2->subclass.integer != 'u')) {
@@ -3048,7 +3128,7 @@ static void *voter_primary_client(void *data)
 	socklen_t fromlen;
 	ssize_t recvlen;
 	struct voter_client *client;
-	struct timeval tv, lasttx, lastrx;
+	struct timeval lasttx, lastrx, currenttime;
 	VOTER_PACKET_HEADER *vph;
 	uint32_t resp_digest, digest, mydigest;
 #pragma pack(push)
@@ -3080,9 +3160,9 @@ static void *voter_primary_client(void *data)
 		 * fd will be positive (and equal to pri_socket) if there is valid activity on the UDP socket.
 		 */
 
-		gettimeofday(&tv, NULL);
+		currenttime = ast_radio_tvnow();
 		memset(&authpacket, 0, sizeof(authpacket));
-		if (!p->priconn && (ast_tvzero(lasttx) || (voter_tvdiff_ms(tv, lasttx) >= 500))) {
+		if (!p->priconn && (ast_tvzero(lasttx) || (voter_tvdiff_ms(currenttime, lasttx) >= 500))) {
 			authpacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
 			authpacket.vp.curtime.vtime_nsec = htonl(voter_timing_count);
 			ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
@@ -3091,13 +3171,13 @@ static void *voter_primary_client(void *data)
 			ast_debug(3, "VOTER %i: Sent primary client auth to %s:%d\n", p->nodenum, ast_inet_ntoa(p->primary.sin_addr),
 				ntohs(p->primary.sin_port));
 			sendto(pri_socket, &authpacket, sizeof(authpacket), 0, (struct sockaddr *) &p->primary, sizeof(p->primary));
-			lasttx = tv;
+			lasttx = currenttime;
 		}
 		/* The host doesn't have GPS data to send a client (and there is no point). We use the GPS payload
 		 * (Payload 2) to send a keepalive packet to keep our UDP session alive. The client does nothing
 		 * with this packet.
 		 */
-		if (p->priconn && (ast_tvzero(lasttx) || (voter_tvdiff_ms(tv, lasttx) >= 1000))) {
+		if (p->priconn && (ast_tvzero(lasttx) || (voter_tvdiff_ms(currenttime, lasttx) >= 1000))) {
 			authpacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
 			authpacket.vp.curtime.vtime_nsec = htonl(voter_timing_count);
 			ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
@@ -3106,9 +3186,9 @@ static void *voter_primary_client(void *data)
 			ast_debug(5, "VOTER %i: Sent primary client keepalive to %s:%d\n", p->nodenum, ast_inet_ntoa(p->primary.sin_addr),
 				ntohs(p->primary.sin_port));
 			sendto(pri_socket, &authpacket, sizeof(authpacket) - 1, 0, (struct sockaddr *) &p->primary, sizeof(p->primary));
-			lasttx = tv;
+			lasttx = currenttime;
 		}
-		if (p->priconn && (ast_tvzero(lastrx) || (voter_tvdiff_ms(tv, lastrx) >= 2000))) {
+		if (p->priconn && (ast_tvzero(lastrx) || (voter_tvdiff_ms(currenttime, lastrx) >= 2000))) {
 			p->priconn = 0;
 			digest = 0;
 			p->primary_challenge[0] = 0;
@@ -3157,7 +3237,7 @@ static void *voter_primary_client(void *data)
 							ast_verb(3, "VOTER %i: Primary client connected (with challenge=%s)\n", p->nodenum, p->primary_challenge);
 						}
 						p->priconn = 1;
-						lastrx = tv;
+						lastrx = ast_radio_tvnow();
 					} else {
 						p->priconn = 0;
 						digest = 0;
@@ -3171,7 +3251,7 @@ static void *voter_primary_client(void *data)
 }
 
 /*!
- * \brief Manage and dispatch transmit activity for a single VOTER instance.
+ * \brief Manage and dispatch transmit activity from the Asterisk core for a single VOTER instance.
  *
  * Runs the per-node transmit worker: consumes queued Asterisk frames and pager frames,
  * integrates PMR channel input, performs optional mix-minus and format conversions,
@@ -3188,7 +3268,7 @@ static void *voter_xmit(void *data)
 	i32 l;
 	struct ast_frame fr, *f1, *f2, *f3, wf1;
 	struct voter_client *client, *client1;
-	struct timeval tv;
+	struct timeval currenttime;
 
 #pragma pack(push)
 #pragma pack(1)
@@ -3348,7 +3428,7 @@ static void *voter_xmit(void *data)
 		/* This first "if" will send ulaw audio out all regular or mixminus clients by default. */
 		if (x || mx) {
 			memset(&audiopacket, 0, sizeof(audiopacket) - sizeof(audiopacket.audio));
-			memset(&audiopacket.audio, 0xff, sizeof(audiopacket.audio));
+			memset(&audiopacket.audio, ULAW_SILENCE, sizeof(audiopacket.audio));
 			ast_copy_string((char *) audiopacket.vp.challenge, challenge, sizeof(audiopacket.vp.challenge));
 			audiopacket.vp.payload_type = htons(VOTER_PAYLOAD_ULAW);
 			audiopacket.rssi = 0;
@@ -3476,7 +3556,7 @@ static void *voter_xmit(void *data)
 							sizeof(client->sin));
 					}
 					/* Update when this client last sent an audio packet */
-					gettimeofday(&client->lastsenttime, NULL);
+					client->lastsenttime = ast_radio_tvnow();
 				}
 			}
 		}
@@ -3485,7 +3565,7 @@ static void *voter_xmit(void *data)
 			if (p->adpcmf1 == NULL) {
 				p->adpcmf1 = ast_frdup(f1);
 			} else {
-				memset(xmtbuf, 0xff, sizeof(xmtbuf));
+				memset(xmtbuf, ULAW_SILENCE, sizeof(xmtbuf));
 				memset(&fr, 0, sizeof(fr));
 				fr.frametype = AST_FRAME_VOICE;
 				fr.subclass.format = ast_format_ulaw;
@@ -3554,7 +3634,7 @@ static void *voter_xmit(void *data)
 								sizeof(client->sin));
 						}
 						/* Update when this client last sent an audio packet */
-						gettimeofday(&client->lastsenttime, NULL);
+						client->lastsenttime = ast_radio_tvnow();
 					}
 #endif
 				}
@@ -3564,52 +3644,74 @@ static void *voter_xmit(void *data)
 		if (f1) {
 			ast_frfree(f1);
 		}
+		/* Get the current time for ping and keeplive packet tracking. */
+		currenttime = ast_radio_tvnow();
 		/* Process sending ping packets for each client, if necessary */
-		gettimeofday(&tv, NULL);
+		ast_mutex_lock(&voter_lock);
 		for (client = clients; client; client = client->next) {
+			/* Skip if this client doesn't belong to this instance. */
 			if (client->nodenum != p->nodenum) {
 				continue;
 			}
+			/* Skip clients that aren't authenticated. */
 			if (!client->respdigest) {
 				continue;
 			}
+			/* Skip clients that aren't connected. */
 			if (!client->heardfrom) {
 				continue;
 			}
+			/* Skip clients connected via a proxy. */
 			if (IS_CLIENT_PROXY(client)) {
 				continue;
 			}
+			/* If we are pinging a client, see if we're finished yet. If we are, the
+			 * results will be printed, and client->pings_requested is going to be set
+			 * to 0, causing us to continue skipping this client (stop pinging).
+			 */
 			check_ping_done(client);
+			/* Skip clients that we're not pinging (client->pings_requested will be 0). */
 			if (!client->pings_requested) {
 				continue;
 			}
+			/* If we've already sent more pings to a client than we need to, skip (we should
+			 * already be done!).
+			 */
 			if (client->pings_sent >= client->pings_requested) {
 				continue;
 			}
-			if (voter_tvdiff_ms(tv, client->ping_txtime) >= (PING_TIME_MS * client->pings_sent)) {
+			/* At this point, we have outstanding pings to send to this client, so do it. */
+			if (voter_tvdiff_ms(currenttime, client->ping_txtime) >= (PING_TIME_MS * client->pings_sent)) {
+				/* If we haven't sent any pings to the client yet, let's get started. */
 				if (!client->pings_sent) {
-					client->ping_txtime = ast_tvnow();
+					/* Timestamp when we sent the first ping (client->ping_txtime). */
+					client->ping_txtime = currenttime;
 					memset(&client->ping_last_rxtime, 0, sizeof(client->ping_last_rxtime));
 				}
+				/* Increment the number of ping packets we've sent to this client. */
 				client->pings_sent++;
+				/* Build and send the ping packet to the client. */
 				memset(&pingpacket, 0, sizeof(pingpacket));
 				pingpacket.seqno = ++client->ping_seqno;
 				for (i = 0; i < sizeof(pingpacket.filler); i++) {
 					pingpacket.filler[i] = (pingpacket.seqno & 0xff) + i;
 				}
-				pingpacket.txtime = tv;
+				/* Set the time this packet was sent to the current time. */
+				pingpacket.txtime = currenttime;
+				/* Set the start time to when we sent the first packet (from above). */
 				pingpacket.starttime = client->ping_txtime;
 				ast_copy_string((char *) pingpacket.vp.challenge, challenge, sizeof(pingpacket.vp.challenge));
 				pingpacket.vp.payload_type = htons(VOTER_PAYLOAD_PING);
 				pingpacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
-				pingpacket.vp.curtime.vtime_nsec = htonl(master_time.vtime_nsec);
 				mkpucked(client, &pingpacket.vp.curtime);
 				pingpacket.vp.digest = htonl(client->respdigest);
 				pingpacket.vp.curtime.vtime_nsec = client->mix ? htonl(client->txseqno) : htonl(master_time.vtime_nsec);
 				ast_debug(2, "VOTER %i: Sending ping packet to client %s digest %08x\n", p->nodenum, client->name, client->respdigest);
+				/* Send the ping packet on the wire. */
 				sendto(udp_socket, &pingpacket, sizeof(pingpacket), 0, (struct sockaddr *) &client->sin, sizeof(client->sin));
 			}
 		}
+		ast_mutex_unlock(&voter_lock);
 		/* Process sending keepalive packets for each client, if necessary */
 		for (client = clients; client; client = client->next) {
 			if (client->nodenum != p->nodenum) {
@@ -3628,7 +3730,7 @@ static void *voter_xmit(void *data)
 			 * (Payload 2) to send a keepalive packet to keep our UDP session alive. The client does nothing
 			 * with this packet.
 			 */
-			if (ast_tvzero(client->lastsenttime) || (voter_tvdiff_ms(tv, client->lastsenttime) >= TX_KEEPALIVE_MS)) {
+			if (ast_tvzero(client->lastsenttime) || (voter_tvdiff_ms(currenttime, client->lastsenttime) >= TX_KEEPALIVE_MS)) {
 				memset(&audiopacket, 0, sizeof(audiopacket));
 				ast_copy_string((char *) audiopacket.vp.challenge, challenge, sizeof(audiopacket.vp.challenge));
 				audiopacket.vp.curtime.vtime_sec = htonl(master_time.vtime_sec);
@@ -3655,7 +3757,8 @@ static void *voter_xmit(void *data)
 					sendto(udp_socket, &audiopacket, sizeof(VOTER_PACKET_HEADER), 0, (struct sockaddr *) &client->sin,
 						sizeof(client->sin));
 				}
-				gettimeofday(&client->lastsenttime, NULL);
+				/* Update when this client last sent a keepalive packet */
+				client->lastsenttime = ast_radio_tvnow();
 			}
 		}
 	}
@@ -4349,14 +4452,14 @@ static int reload(void)
 					ast_config_destroy(cfg);
 					return -1;
 				}
-				memset(client->audio, 0xff, client->buflen);
+				memset(client->audio, ULAW_SILENCE, client->buflen);
 			} else if (!client->audio) {
 				client->audio = ast_malloc(client->buflen);
 				if (!client->audio) {
 					ast_config_destroy(cfg);
 					return -1;
 				}
-				memset(client->audio, 0xff, client->buflen);
+				memset(client->audio, ULAW_SILENCE, client->buflen);
 			}
 			if (client->rssi && client->old_buflen && (client->buflen != client->old_buflen)) {
 				client->rssi = ast_realloc(client->rssi, client->buflen);
@@ -4498,7 +4601,7 @@ static void *voter_timer(void *data)
 {
 	struct voter_pvt *p;
 	struct voter_client *client, *client1;
-	struct timeval tv;
+	struct timeval mix_time;
 	char client_ip[INET_ADDRSTRLEN];
 	char client1_ip[INET_ADDRSTRLEN];
 
@@ -4530,17 +4633,20 @@ static void *voter_timer(void *data)
 		 * master_time.vtime_sec will be set in voter_reader from the
 		 * timestamp embedded in the packets from the master client.
 		 *
-		 * Changed from using time() to using gettimeofday() so that all
-		 * our timing is consistent. The two functions may not return the
-		 * "same time", which could lead to random disconnects of mix mode
-		 * clients. See Issue 902.
+		 * We're using system clock (wall time), since this time gets
+		 * put in the packet header sent to the client, which in turn
+		 * uses it in its status display.
+		 *
+		 * Initialize master_time.vtime_nsec to 0, since we don't have a
+		 * master client, and it gets used for a sequence number later.
 		 */
-		gettimeofday(&tv, NULL);
+		mix_time = ast_tvnow();
 		if (!hasmaster) {
-			master_time.vtime_sec = tv.tv_sec;
+			master_time.vtime_sec = mix_time.tv_sec;
+			master_time.vtime_nsec = 0;
 
 			for (p = pvts; p; p = p->next) {
-				memset(p->buf + AST_FRIENDLY_OFFSET, 0xff, FRAME_SIZE);
+				memset(p->buf + AST_FRIENDLY_OFFSET, ULAW_SILENCE, FRAME_SIZE);
 				voter_mix_and_send(p, NULL, 0);
 			}
 
@@ -4562,8 +4668,8 @@ static void *voter_timer(void *data)
 				/* See if it has been too long since we heard from the client, master
 				 * client timing is more strict.
 				 */
-				if (!ast_tvzero(client->lastheardtime) &&
-					(voter_tvdiff_ms(tv, client->lastheardtime) > ((client->ismaster) ? MASTER_TIMEOUT_MS : CLIENT_TIMEOUT_MS))) {
+				if (!ast_tvzero(client->lastheardtime) && (voter_tvdiff_ms(ast_radio_tvnow(), client->lastheardtime) >
+															  ((client->ismaster) ? MASTER_TIMEOUT_MS : CLIENT_TIMEOUT_MS))) {
 					ast_log(LOG_NOTICE, "VOTER %u: Client %s disconnect (timeout)\n", client->nodenum, client->name);
 					client->heardfrom = 0;
 					client->respdigest = 0;
@@ -4665,11 +4771,11 @@ static void *voter_reader(void *data)
 	char client1_ip[INET_ADDRSTRLEN];
 	struct sockaddr_in sin, sin_stream, psin;
 	struct voter_pvt *p;
-	int fd, i, j, k, timeout_ms, maxrssi, master_port, no_ast_channel = 0, logged_no_ast_channel = 0, logged_buflen_too_small = 0;
+	int fd, i, j, timeout_ms, maxrssi, master_port, no_ast_channel = 0, logged_no_ast_channel = 0, logged_buflen_too_small = 0, buffer_bytes_avail;
 	struct ast_frame *f1, fr;
 	socklen_t fromlen;
 	ssize_t recvlen;
-	struct timeval tv, timetv;
+	struct timeval systemtime, timetv;
 	FILE *gpsfp;
 	struct voter_client *client = NULL, *client1, *maxclient, *lastmaster;
 	VOTER_PACKET_HEADER *vph;
@@ -4678,7 +4784,6 @@ static void *voter_reader(void *data)
 	VOTER_REC rec;
 	VOTER_STREAM stream;
 	time_t timestuff, t;
-	short silbuf[FRAME_SIZE];
 #pragma pack(push)
 #pragma pack(1)
 #ifdef ADPCM_LOOPBACK
@@ -4720,12 +4825,16 @@ static void *voter_reader(void *data)
 		 */
 
 		/* First, check all of our Asterisk channels to see if any were receiving and have now stopped (timed out). */
-		gettimeofday(&tv, NULL);
 		for (p = pvts; p; p = p->next) {
+			/* If the instance is already un-keyed, skip. */
 			if (!p->rxkey) {
 				continue;
 			}
-			if (voter_tvdiff_ms(tv, p->lastrxtime) > RX_TIMEOUT_MS) {
+			/* This is the actual logic to determine when to stop receiving, and de-assert the
+			 * effective "COS". Compare the time we last received a datagram from the client with
+			 * RX_TIMEOUT_MS, and de-key accordingly.
+			 */
+			if (voter_tvdiff_ms(ast_radio_tvnow(), p->lastrxtime) > RX_TIMEOUT_MS) {
 				struct ast_frame wf = {
 					.frametype = AST_FRAME_CONTROL,
 					.subclass.integer = AST_CONTROL_RADIO_UNKEY,
@@ -4733,8 +4842,12 @@ static void *voter_reader(void *data)
 				};
 				ast_debug(3, "A VOTER on %d was receiving but now has stopped (RX_TIMEOUT_MS)!\n", p->nodenum);
 				ast_queue_frame(p->owner, &wf);
+				/* De-assert COS and reset parameters for next time. */
 				p->rxkey = 0;
 				p->lastwon = NULL;
+				p->threshold = 0;
+				p->threshcount = 0;
+				p->lingercount = 0;
 			}
 		}
 
@@ -4785,10 +4898,9 @@ static void *voter_reader(void *data)
 		 * Upon initial connect from a client, vph->digest will be 0, so this won't match any
 		 * configured client in voter.conf, triggering the authentication process.
 		 */
-		gettimeofday(&tv, NULL);
 		for (client = clients; client; client = client->next) {
 			if (client->digest == htonl(vph->digest)) {
-				client->lastheardtime = tv;
+				client->lastheardtime = ast_radio_tvnow();
 				client->heardfrom = 1;
 				break;
 			}
@@ -4810,10 +4922,13 @@ static void *voter_reader(void *data)
 			 */
 			ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
 
-			/* Put our current system time into the packet header. */
-			gettimeofday(&tv, NULL);
-			authpacket.vp.curtime.vtime_sec = htonl(tv.tv_sec);
-			authpacket.vp.curtime.vtime_nsec = htonl(tv.tv_usec * 1000);
+			/* Put our current system time into the packet header. We use
+			 * wall time because the client pulls the time from the packet
+			 * header for use in its status display.
+			 */
+			systemtime = ast_tvnow();
+			authpacket.vp.curtime.vtime_sec = htonl(systemtime.tv_sec);
+			authpacket.vp.curtime.vtime_nsec = htonl(systemtime.tv_usec * 1000);
 
 			/* Make our response digest based on the challenge sent by the client, and our host password,
 			 * and put that in the packet header, along with blank flags.
@@ -4822,8 +4937,8 @@ static void *voter_reader(void *data)
 			authpacket.flags = 0;
 
 			/* Do the same for proxy authentication packets. */
-			proxy_authpacket.vp.curtime.vtime_sec = htonl(tv.tv_sec);
-			proxy_authpacket.vp.curtime.vtime_nsec = htonl(tv.tv_usec * 1000);
+			proxy_authpacket.vp.curtime.vtime_sec = htonl(systemtime.tv_sec);
+			proxy_authpacket.vp.curtime.vtime_nsec = htonl(systemtime.tv_usec * 1000);
 			proxy_authpacket.vp.digest = htonl(crc32_bufs((char *) vph->challenge, password));
 			proxy_authpacket.flags = 0;
 
@@ -5043,12 +5158,15 @@ static void *voter_reader(void *data)
 			/* Set the response digest for this client, based on the challenge they sent and our password */
 			client->respdigest = crc32_bufs((char *) vph->challenge, password);
 
-			/* Put our current system time into the packet header. */
-			gettimeofday(&tv, NULL);
-			authpacket.vp.curtime.vtime_sec = htonl(tv.tv_sec);
-			authpacket.vp.curtime.vtime_nsec = htonl(tv.tv_usec * 1000);
-			/* Timestamp when we last heard this client (system time). */
-			client->lastheardtime = tv;
+			/* Put our current system time into the packet header. We use
+			 * wall time since the client uses the time from the packet
+			 * header for its status display.
+			 */
+			systemtime = ast_tvnow();
+			authpacket.vp.curtime.vtime_sec = htonl(systemtime.tv_sec);
+			authpacket.vp.curtime.vtime_nsec = htonl(systemtime.tv_usec * 1000);
+			/* Timestamp when we last heard this client. */
+			client->lastheardtime = ast_radio_tvnow();
 
 			/* Make our response digest based on the challenge sent by the client, and our host password,
 			 * and put that in the packet header.
@@ -5056,8 +5174,8 @@ static void *voter_reader(void *data)
 			authpacket.vp.digest = htonl(crc32_bufs((char *) vph->challenge, password));
 
 			/* Do the same for proxy authentication packets. */
-			proxy_authpacket.vp.curtime.vtime_sec = htonl(tv.tv_sec);
-			proxy_authpacket.vp.curtime.vtime_nsec = htonl(tv.tv_usec * 1000);
+			proxy_authpacket.vp.curtime.vtime_sec = htonl(systemtime.tv_sec);
+			proxy_authpacket.vp.curtime.vtime_nsec = htonl(systemtime.tv_usec * 1000);
 			proxy_authpacket.vp.digest = htonl(crc32_bufs((char *) vph->challenge, password));
 
 			/* Send the response packet to the client. */
@@ -5130,7 +5248,7 @@ static void *voter_reader(void *data)
 				/* If the client is a potential master client, but the last time we heard
 				 * from it was longer than MASTER_TIMEOUT_MS ago, skip it.
 				 */
-				if (voter_tvdiff_ms(tv, client1->lastheardtime) > MASTER_TIMEOUT_MS) {
+				if (voter_tvdiff_ms(ast_radio_tvnow(), client1->lastheardtime) > MASTER_TIMEOUT_MS) {
 					continue;
 				}
 				/* After all that, this client should be suitable to be designated the
@@ -5159,7 +5277,6 @@ static void *voter_reader(void *data)
 				break;
 			}
 
-			gettimeofday(&tv, NULL);
 			/* Go through all the clients, and stop when we find an authenticated
 			 * client (has client->digest set) that matches the digest we received on the
 			 * wire (vph->digest). This will be the current client.
@@ -5169,7 +5286,7 @@ static void *voter_reader(void *data)
 			 */
 			for (client = clients; client; client = client->next) {
 				if (client->digest == htonl(vph->digest)) {
-					client->lastheardtime = tv;
+					client->lastheardtime = ast_radio_tvnow();
 					break;
 				}
 			}
@@ -5198,7 +5315,7 @@ static void *voter_reader(void *data)
 				}
 
 				/* If we are supposed to have a master client (hasmaster), but the
-				 * current active master has no longer true, we'll put silence in to
+				 * current active master is no longer true, we'll put silence in to
 				 * the audio buffer, set the RSSI to 0, unkey the channel, and do
 				 * some other cleanup.
 				 */
@@ -5207,11 +5324,19 @@ static void *voter_reader(void *data)
 						ast_log(LOG_WARNING, "VOTER lost master timing source!!\n");
 						last_master_count = 0;
 						master_time.vtime_sec = 0;
+						master_time.vtime_nsec = 0;
+						/* Scan through the clients and fill the audio buffer with silence,
+						 * and set RSSI to 0.
+						 */
 						for (client1 = client->next; client1; client1 = client1->next) {
-							memset(client1->audio, 0xff, client1->buflen);
+							memset(client1->audio, ULAW_SILENCE, client1->buflen);
 							memset(client1->rssi, 0, client1->buflen);
 						}
+						/* Scan through all the VOTER instances. */
 						for (p = pvts; p; p = p->next) {
+							/* If the instance is keyed (COS asserted according to p->rxkey),
+							 * tell Asterisk to un-key the channel.
+							 */
 							if (p->rxkey) {
 								struct ast_frame wf = {
 									.frametype = AST_FRAME_CONTROL,
@@ -5221,7 +5346,11 @@ static void *voter_reader(void *data)
 
 								ast_queue_frame(p->owner, &wf);
 							}
+							/* De-assert COS and reset parameters for next time. */
 							p->lastwon = NULL;
+							p->threshold = 0;
+							p->threshcount = 0;
+							p->lingercount = 0;
 							p->rxkey = 0;
 							ast_mutex_lock(&p->txqlock);
 							while ((f1 = AST_LIST_REMOVE_HEAD(&p->txq, frame_list)) != NULL) {
@@ -5241,9 +5370,17 @@ static void *voter_reader(void *data)
 			if (DEBUG_ATLEAST(4) && client && ntohs(vph->payload_type) == VOTER_PAYLOAD_ULAW &&
 				recvlen > sizeof(VOTER_PACKET_HEADER) && ((unsigned char) *(buf + sizeof(VOTER_PACKET_HEADER)) > 0)) {
 				timestuff = (time_t) ntohl(vph->curtime.vtime_sec);
-				strftime(timestr, sizeof(timestr) - 1, "%Y %T", localtime((time_t *) &timestuff));
-				ast_debug(4, "Client %s sending time: %s.%03d, RSSI: %d\n", client->name, timestr,
-					ntohl(vph->curtime.vtime_nsec) / 1000000, (unsigned char) *(buf + sizeof(VOTER_PACKET_HEADER)));
+				/* If this is a mix client, timestuff will be 0 (GPS epoch). Rather than displaying the
+				 * GPS epoch date (from 1969), just print "No time sent".
+				 */
+				if (!timestuff) {
+					ast_debug(4, "Client %s sending time: No time sent, RSSI: %d\n", client->name,
+						(unsigned char) *(buf + sizeof(VOTER_PACKET_HEADER)));
+				} else {
+					strftime(timestr, sizeof(timestr) - 1, "%Y %T", localtime((time_t *) &timestuff));
+					ast_debug(4, "Client %s sending time: %s.%03d, RSSI: %d\n", client->name, timestr,
+						ntohl(vph->curtime.vtime_nsec) / 1000000, (unsigned char) *(buf + sizeof(VOTER_PACKET_HEADER)));
+				}
 			}
 
 			/* If we have a valid (authenticated) client, have recently heard from it, and it sent
@@ -5266,7 +5403,7 @@ static void *voter_reader(void *data)
 					long long btime, ptime, difftime;
 					int index, flen;
 
-					gettimeofday(&client->lastheardtime, NULL); /* Timestamp when we last heard this client (system time). */
+					client->lastheardtime = ast_radio_tvnow(); /* Timestamp when we last heard this client */
 					if (client->curmaster) {
 						if (!master_time.vtime_sec) {
 							for (p = pvts; p; p = p->next) {
@@ -5443,7 +5580,7 @@ static void *voter_reader(void *data)
 							strftime(timestr, sizeof(timestr), "%Y %T", localtime(&timestuff));
 							ast_debug(5, "MasterTime: %s.%03d\n", timestr, master_time.vtime_nsec / 1000000);
 							/* Get the system time so we can display it */
-							gettimeofday(&timetv, NULL);
+							timetv = ast_tvnow();
 							timestuff = (time_t) timetv.tv_sec;
 							strftime(timestr, sizeof(timestr), "%Y %T", localtime(&timestuff));
 							ast_debug(5, "SysTime:    %s.%03d\n", timestr, (int) timetv.tv_usec / 1000);
@@ -5458,7 +5595,7 @@ static void *voter_reader(void *data)
 							/* If no RSSI, just make it quiet. */
 
 							for (i = 0; i < FRAME_SIZE; i++) {
-								buf[sizeof(VOTER_PACKET_HEADER) + i + 1] = 0xff;
+								buf[sizeof(VOTER_PACKET_HEADER) + i + 1] = ULAW_SILENCE;
 							}
 						} else if (ntohs(vph->payload_type) == VOTER_PAYLOAD_ADPCM) {
 							/* If otherwise (RSSI > 0), if ADPCM audio packet, translate it. */
@@ -5490,15 +5627,22 @@ static void *voter_reader(void *data)
 							index = (index + client->drainindex_40ms) % client->buflen;
 						}
 						flen = (f1) ? f1->datalen : FRAME_SIZE;
-						i = (int) client->buflen - (index + flen);
-						if (i >= 0) {
+						/* Figure out where in the ring buffer we are. */
+						buffer_bytes_avail = client->buflen - (index + flen);
+						/* If buffer_bytes_avail is positive, just keep filling client->audio and client->rssi
+						 * from the buffer.
+						 * If buffer_bytes_avail is negative, the buffer has wrapped. Get the data from the end of the
+						 * buffer, then wrap around and get the rest from the beginning of the buffer.
+						 */
+						if (buffer_bytes_avail >= 0) {
 							memcpy(client->audio + index, ((f1) ? f1->data.ptr : buf + sizeof(VOTER_PACKET_HEADER) + 1), flen);
 							memset(client->rssi + index, buf[sizeof(VOTER_PACKET_HEADER)], flen);
 						} else {
-							memcpy(client->audio + index, ((f1) ? f1->data.ptr : buf + sizeof(VOTER_PACKET_HEADER) + 1), flen + i);
-							memset(client->rssi + index, buf[sizeof(VOTER_PACKET_HEADER)], flen + i);
-							memcpy(client->audio, ((f1) ? f1->data.ptr : buf + sizeof(VOTER_PACKET_HEADER) + 1) + (flen + i), -i);
-							memset(client->rssi, buf[sizeof(VOTER_PACKET_HEADER)], -i);
+							memcpy(client->audio + index, ((f1) ? f1->data.ptr : buf + sizeof(VOTER_PACKET_HEADER) + 1), flen + buffer_bytes_avail);
+							memset(client->rssi + index, buf[sizeof(VOTER_PACKET_HEADER)], flen + buffer_bytes_avail);
+							memcpy(client->audio, ((f1) ? f1->data.ptr : buf + sizeof(VOTER_PACKET_HEADER) + 1) + (flen + buffer_bytes_avail),
+								-buffer_bytes_avail);
+							memset(client->rssi, buf[sizeof(VOTER_PACKET_HEADER)], -buffer_bytes_avail);
 						}
 						if (f1) {
 							ast_frfree(f1);
@@ -5589,7 +5733,7 @@ static void *voter_reader(void *data)
 							maxrssi = 0;
 							maxclient = NULL;
 							for (client = clients; client; client = (startagain) ? clients : client->next) {
-								int maxprio, thisprio;
+								int maxprio, thisprio, rssi_sum;
 
 								startagain = 0;
 								/* If the client doesn't belong to this VOTER instance, skip it. */
@@ -5609,21 +5753,31 @@ static void *voter_reader(void *data)
 									(client->prio == PRIO_LOCKOUT && client->prio_override < PRIO_NORMAL)) {
 									continue;
 								}
-								k = 0;
-								i = (int) client->buflen - ((int) client->drainindex + FRAME_SIZE);
-								if (i >= 0) {
+								/* Calculate the RSSI based on any RSSI samples in the buffer */
+								rssi_sum = 0;
+								/* Figure out where in the ring buffer we are.*/
+								buffer_bytes_avail = client->buflen - (client->drainindex + FRAME_SIZE);
+								/* If buffer_bytes_avail is positive, just keep getting RSSI values from the buffer
+								 * and add them to the sum.
+								 * If buffer_bytes_avail is negative, the buffer has wrapped. Get the RSSI data
+								 * from the end of the buffer, then wrap around and get the rest from the beginning of the buffer.
+								 */
+								if (buffer_bytes_avail >= 0) {
 									for (j = client->drainindex; j < client->drainindex + FRAME_SIZE; j++) {
-										k += client->rssi[j];
+										rssi_sum += client->rssi[j];
 									}
 								} else {
-									for (j = client->drainindex; j < client->drainindex + (FRAME_SIZE + i); j++) {
-										k += client->rssi[j];
+									for (j = client->drainindex; j < client->drainindex + (FRAME_SIZE + buffer_bytes_avail); j++) {
+										rssi_sum += client->rssi[j];
 									}
-									for (j = 0; j < -i; j++) {
-										k += client->rssi[j];
+									for (j = 0; j < -buffer_bytes_avail; j++) {
+										rssi_sum += client->rssi[j];
 									}
 								}
-								client->lastrssi = k / FRAME_SIZE;
+								/* Take the sum of all the RSSI samples we found, get the average, and set client->lastrssi
+								 * for this client based on the result.
+								 */
+								client->lastrssi = rssi_sum / FRAME_SIZE;
 								maxprio = thisprio = 0;
 								/* If maxclient has an overridden priority (> -2/PRIO_DEFAULT), set maxprio with the overridden
 								 * priority, otherwise, use the priority from voter.conf (normally 0, if not specifically set).
@@ -5670,24 +5824,35 @@ static void *voter_reader(void *data)
 									(client->prio == PRIO_LOCKOUT && client->prio_override < PRIO_NORMAL)) {
 									continue;
 								}
-								i = (int) client->buflen - ((int) client->drainindex + FRAME_SIZE);
-								if (i >= 0) {
+								/* Zero out all the RSSI values for the client, starting with figuring out where
+								 * in the ring buffer we are.
+								 * If buffer_bytes_avail is positive, just keep zeroing out the RSSI values in the buffer.
+								 * If buffer_bytes_avail is negative, the buffer has wrapped. Zero out the RSSI data
+								 * from the end of the buffer, then wrap around and zero out the rest from the beginning.
+								 */
+								buffer_bytes_avail = client->buflen - (client->drainindex + FRAME_SIZE);
+								if (buffer_bytes_avail >= 0) {
 									for (j = client->drainindex; j < client->drainindex + FRAME_SIZE; j++) {
 										client->rssi[j] = 0;
 									}
 								} else {
-									for (j = client->drainindex; j < client->drainindex + (FRAME_SIZE + i); j++) {
+									for (j = client->drainindex; j < client->drainindex + (FRAME_SIZE + buffer_bytes_avail); j++) {
 										client->rssi[j] = 0;
 									}
-									for (j = 0; j < -i; j++) {
+									for (j = 0; j < -buffer_bytes_avail; j++) {
 										client->rssi[j] = 0;
 									}
 								}
 							}
 							if (!maxclient) {
 								maxrssi = 0;
+								/* Ensure the test cycle and index are reset when no client is selected
+								 * to prevent stale values.
+								 */
+								p->testcycle = 0;
+								p->testindex = 0;
 							}
-							memset(p->buf + AST_FRIENDLY_OFFSET, 0xff, FRAME_SIZE);
+							memset(p->buf + AST_FRIENDLY_OFFSET, ULAW_SILENCE, FRAME_SIZE);
 							if (maxclient) {
 								int maxprio, lastprio;
 								/* If maxclient has an overridden priority (> -2/PRIO_DEFAULT), set maxprio with the overridden
@@ -5760,82 +5925,118 @@ static void *voter_reader(void *data)
 									maxclient = p->lastwon;
 									maxrssi = maxclient->lastrssi;
 								}
-								if (p->voter_test > 0) { /* Perform cyclic selection. */
-									/* See how many clients are eligible to cycle through. */
+								/* VOTER test mode initiated by the voter test CLI command. Only applies
+								 * to voting clients (not mix mode operation).
+								 * voter_test = 0 is normal voting operation
+								 * voter_test = 1 randomly pick which client of all that are receiving at
+								 * the max RSSI value to use
+								 * voter_test > 1 cycle thru all the clients that are receiving at the max
+								 * RSSI value with a cycle time of (test mode - 1) frames. In other words,
+								 * if you set it to 2, it will change every single time. If you set it to
+								 * 11, it will change every 10 times. This is serious torture test.
+								 */
+								if (p->voter_test > 0) { /* Perform cyclic test mode. */
+									/* Count the number of clients at maxrssi to see how many to cycle through. */
 									for (i = 0, client = clients; client; client = client->next) {
+										/* If the client doesn't belong to this VOTER instance, skip it. */
 										if (client->nodenum != p->nodenum) {
 											continue;
 										}
+										/* If this is a mix client, skip it. */
 										if (client->mix) {
 											continue;
 										}
-										if (client->lastrssi == maxrssi) {
+										/* Count the clients at maxrssi (clients also must have a positive RSSI). */
+										if (client->lastrssi > 0 && client->lastrssi == maxrssi) {
 											i++;
 										}
 									}
-									if (p->voter_test == 1) {
-										p->testindex = random() % i;
+									/* Randomly cycle through all the clients at maxrssi, or
+									 * cycle every test_mode - 1 frames.
+									 *
+									 * If we didn't find any suitable clients (i == 0), we
+									 * won't do anything.
+									 */
+									if (i == 0) {
+										p->testcycle = 0;
+										p->testindex = 0;
 									} else {
-										p->testcycle++;
-										if (p->testcycle >= (p->voter_test - 1)) {
-											p->testcycle = 0;
-											p->testindex++;
-											if (p->testindex >= i) {
-												p->testindex = 0;
+										if (p->voter_test == 1) {
+											p->testindex = ast_random() % i;
+										} else {
+											p->testcycle++;
+											if (p->testcycle >= (p->voter_test - 1)) {
+												p->testcycle = 0;
+												p->testindex++;
+												if (p->testindex >= i) {
+													p->testindex = 0;
+												}
 											}
 										}
 									}
+									/* Count the number of clients still at maxrssi, and stop when
+									 * we reach the testindex computed above?
+									 */
 									for (i = 0, client = clients; client; client = client->next) {
+										/* If the client doesn't belong to this VOTER instance, skip it. */
 										if (client->nodenum != p->nodenum) {
 											continue;
 										}
+										/* If this is a mix client, skip it. */
 										if (client->mix) {
 											continue;
 										}
-										if (client->lastrssi != maxrssi) {
+										/* If this is client isn't at maxrssi, or has a non-positive RSSI, skip it. */
+										if (client->lastrssi <= 0 || client->lastrssi != maxrssi) {
 											continue;
 										}
+										/* See if the current number of clients matches p->testindex,
+										 * and stop if it does.
+										 */
 										if (i++ == p->testindex) {
 											maxclient = client;
 											maxrssi = client->lastrssi;
 											break;
 										}
 									}
+									/* When testing is complete, reset the test index and cycle. */
 								} else {
 									p->testcycle = 0;
 									p->testindex = 0;
 								}
-								if (!maxclient) { /* If nothing there */
-									memset(silbuf, 0, sizeof(silbuf));
-									memset(&fr, 0, sizeof(fr));
-									fr.frametype = AST_FRAME_VOICE;
-									fr.subclass.format = ast_format_slin;
-									fr.datalen = FRAME_SIZE * 2;
-									fr.samples = FRAME_SIZE;
-									fr.data.ptr = silbuf;
-									fr.src = __PRETTY_FUNCTION__;
-									p->threshold = 0;
-									p->threshcount = 0;
-									p->lingercount = 0;
-									p->winner = 0;
-									incr_drainindex(p);
-									ast_queue_frame(p->owner, &fr);
-									continue;
-								}
-								i = (int) maxclient->buflen - ((int) maxclient->drainindex + FRAME_SIZE);
-								if (i >= 0) {
+								/* Figure out where in the ring buffer we are. */
+								buffer_bytes_avail = maxclient->buflen - (maxclient->drainindex + FRAME_SIZE);
+								/* Copy the audio frame from the voted client into the channel (ring) buffer. */
+								/* If buffer_bytes_avail is positive, get the audio from the current position and
+								 * put it in the Asterisk channel buffer.
+								 * If buffer_bytes_avail is negative, the buffer has wrapped. Get the audio
+								 * from the end of the buffer, then wrap around and get the rest from the beginning.
+								 */
+								if (buffer_bytes_avail >= 0) {
 									memcpy(p->buf + AST_FRIENDLY_OFFSET, maxclient->audio + maxclient->drainindex, FRAME_SIZE);
 								} else {
-									memcpy(p->buf + AST_FRIENDLY_OFFSET, maxclient->audio + maxclient->drainindex, FRAME_SIZE + i);
-									memcpy(p->buf + AST_FRIENDLY_OFFSET + (maxclient->buflen - i), maxclient->audio, -i);
+									memcpy(p->buf + AST_FRIENDLY_OFFSET, maxclient->audio + maxclient->drainindex, FRAME_SIZE + buffer_bytes_avail);
+									memcpy(p->buf + AST_FRIENDLY_OFFSET + (FRAME_SIZE + buffer_bytes_avail), maxclient->audio, -buffer_bytes_avail);
 								}
+								/* Cycle through all the clients, if recording has been enabled with voter record,
+								 * write the audio and RSSI for each client to the specified file.
+								 * Finish by writing silence into the client's audio buffer (so we don't leave
+								 * old audio in the ring buffer).
+								 */
 								for (client = clients; client; client = client->next) {
+									/* If the client doesn't belong to this VOTER instance, skip it. */
 									if (client->nodenum != p->nodenum) {
 										continue;
 									}
+									/* If this is a mix client, skip it. */
 									if (client->mix) {
 										continue;
 									}
+									/* Figure out where in the ring buffer we are. */
+									buffer_bytes_avail = client->buflen - (client->drainindex + FRAME_SIZE);
+									/* If a file pointer was set with voter record, write out the raw audio
+									 * and RSSI for each client to the specified file.
+									 */
 									if (p->recfp) {
 										if (!hasmastered) {
 											hasmastered = 1;
@@ -5845,23 +6046,34 @@ static void *voter_reader(void *data)
 										}
 										ast_copy_string(rec.name, client->name, sizeof(rec.name));
 										rec.rssi = client->lastrssi;
-										if (i >= 0) {
+										/* If buffer_bytes_avail is positive, get the audio from the current position.
+										 * If buffer_bytes_avail is negative, the buffer has wrapped. Get the audio
+										 * from the end of the buffer, then wrap around and get the rest from the beginning.
+										 */
+										if (buffer_bytes_avail >= 0) {
 											memcpy(rec.audio, client->audio + client->drainindex, FRAME_SIZE);
 										} else {
-											memcpy(rec.audio, client->audio + client->drainindex, FRAME_SIZE + i);
-											memset(client->audio + client->drainindex, 0xff, FRAME_SIZE + i);
-											memcpy(rec.audio + FRAME_SIZE + i, client->audio, -i);
-											memset(client->audio + client->drainindex, 0xff, FRAME_SIZE + i);
+											memcpy(rec.audio, client->audio + client->drainindex, FRAME_SIZE + buffer_bytes_avail);
+											memcpy(rec.audio + FRAME_SIZE + buffer_bytes_avail, client->audio, -buffer_bytes_avail);
 										}
+										/* Write out the buffer to the recording file. */
 										fwrite(&rec, 1, sizeof(rec), p->recfp);
 									}
-									if (i >= 0) {
-										memset(client->audio + client->drainindex, 0xff, FRAME_SIZE);
+									/* Replace the audio in the ring buffer for each client with silence.
+									 * If buffer_bytes_avail is positive, just keep zeroing out the audio in the buffer.
+									 * If buffer_bytes_avail is negative, the buffer has wrapped. Zero out the audio
+									 * from the end of the buffer, then wrap around and zero out the rest from the beginning.
+									 */
+									if (buffer_bytes_avail >= 0) {
+										memset(client->audio + client->drainindex, ULAW_SILENCE, FRAME_SIZE);
 									} else {
-										memset(client->audio + client->drainindex, 0xff, FRAME_SIZE + i);
-										memset(client->audio, 0xff, -i);
+										memset(client->audio + client->drainindex, ULAW_SILENCE, FRAME_SIZE + buffer_bytes_avail);
+										memset(client->audio, ULAW_SILENCE, -buffer_bytes_avail);
 									}
 								}
+								/* If the PL filter or host de-emphasis options are set for this instance,
+								 * run the audio through their respective DSP filters.
+								 */
 								if (p->plfilter || p->hostdeemp) {
 									short ix;
 									for (i = 0; i < FRAME_SIZE; i++) {
@@ -5876,12 +6088,21 @@ static void *voter_reader(void *data)
 										p->buf[AST_FRIENDLY_OFFSET + i] = AST_LIN2MU(ix);
 									}
 								}
+								/*!
+								 * \todo VE7FET we should remove "streams" support. It was associated
+								 * with votmond and votermon, which are no longer supported.
+								 */
+								/* This next bit is used to stream the audio from the current buffer
+								 * (which should be the voted client?) to the stream(s) as defined
+								 * in voter.conf.
+								 */
 								stream.curtime = master_time;
 								memcpy(stream.audio, p->buf + AST_FRIENDLY_OFFSET, FRAME_SIZE);
 								ast_copy_string(stream.str, maxclient->name, sizeof(stream.str));
 								for (client = clients; client; client = client->next) {
 									int size;
 
+									/* If the client doesn't belong to this VOTER instance, skip it. */
 									if (client->nodenum != p->nodenum) {
 										continue;
 									}
@@ -5907,6 +6128,7 @@ static void *voter_reader(void *data)
 									sendto(udp_socket, &stream, sizeof(stream), 0, (struct sockaddr *) &sin_stream, sizeof(sin_stream));
 									ast_free(cp);
 								}
+								/* Update p->lastwon if the current selected maxclient has changed. */
 								if (maxclient != p->lastwon) {
 									p->lastwon = maxclient;
 									ast_debug(1, "VOTER client %s selected for node %d\n", maxclient->name, p->nodenum);
@@ -5919,7 +6141,9 @@ static void *voter_reader(void *data)
 								}
 								ast_debug(4, "Receiving from client %s RSSI %d\n", maxclient->name, maxrssi);
 							}
-							/* Go send any audio from mix clients. */
+							/* For the current channel (p), send our current voted client (maxclient),
+							 * and its RSSI (maxrssi) to voter_mix_and_send to be sent to Asterisk.
+							 */
 							if (!voter_mix_and_send(p, maxclient, maxrssi)) {
 								continue;
 							}
@@ -5933,20 +6157,30 @@ static void *voter_reader(void *data)
 				int timediff;
 
 				memcpy(&pingpacket, buf, sizeof(pingpacket));
-				gettimeofday(&client->ping_last_rxtime, NULL);
+				/* Mark when this packet was received. */
+				client->ping_last_rxtime = ast_radio_tvnow();
 				/* If ping not for this session */
 				if (voter_tvdiff_ms(client->ping_txtime, pingpacket.starttime)) {
 					continue;
 				}
+				/* Check if the packet we received is out of sequence, log a warning, and increment
+				 * the OOS counter accordingly.
+				 */
 				if (client->ping_last_seqno && (pingpacket.seqno < (client->ping_last_seqno + 1))) {
 					ast_log(LOG_WARNING, "PING (%s): Packets out of sequence!!\n", client->name);
 					client->pings_oos++;
 				}
+				/* Check that the packet we received (client->ping_last_rxtime) was after when the
+				 * packet was sent (pingpacket.txtime). timediff should be positive if this was the
+				 * case, otherwise, log a warning and continue to the next packet without processing
+				 * this one.
+				 */
 				timediff = ast_tvdiff_ms(client->ping_last_rxtime, pingpacket.txtime);
 				if (timediff < 0) {
 					ast_log(LOG_WARNING, "PING (%s): Packet has invalid time (diff=%d)!!\n", client->name, timediff);
 					continue;
 				}
+				/* Update counters and statistics, based on the latest packet received. */
 				client->ping_last_seqno = pingpacket.seqno;
 				client->pings_received++;
 				client->pings_total_ms += timediff;
@@ -5962,11 +6196,10 @@ static void *voter_reader(void *data)
 				if (timediff > client->pings_worst) {
 					client->pings_worst = timediff;
 				}
+				/* Print the sequence number and ping time for this latest packet from the client. */
 				ast_verb(1, "PING (%s) Response:   seqno: %u  diff: %d ms\n", client->name, pingpacket.seqno, timediff);
 
-				timestuff = (time_t) ntohl(vph->curtime.vtime_sec);
-				strftime(timestr, sizeof(timestr), "%Y %T", localtime(&timestuff));
-
+				/* If we are pinging a client, see if we're finished yet. If we are, the results will be printed. */
 				check_ping_done(client);
 				continue;
 			}
@@ -5974,7 +6207,7 @@ static void *voter_reader(void *data)
 			if (client && client->heardfrom && (ntohs(vph->payload_type) == VOTER_PAYLOAD_GPS) &&
 				((recvlen == sizeof(VOTER_PACKET_HEADER)) || (recvlen == (sizeof(VOTER_PACKET_HEADER) + sizeof(VOTER_GPS))) ||
 					(recvlen == ((sizeof(VOTER_PACKET_HEADER) + sizeof(VOTER_GPS)) - 1)))) {
-				gettimeofday(&client->lastheardtime, NULL);
+				client->lastheardtime = ast_radio_tvnow();
 				client->lastgpstime.vtime_sec = ntohl(vph->curtime.vtime_sec);
 				client->lastgpstime.vtime_nsec = ntohl(vph->curtime.vtime_nsec);
 				for (p = pvts; p; p = p->next) {
@@ -6021,12 +6254,18 @@ process_gps:
 				client->lastmastergpstime.vtime_sec = mastergps_time.vtime_sec;
 				client->lastmastergpstime.vtime_nsec = mastergps_time.vtime_nsec;
 				if (DEBUG_ATLEAST(4)) {
-					/* Get and display GPS Time that the client is sending us */
+					/* Get and display GPS Time that the client is sending us. If this is
+					 * a mix client, timestuff will be 0 (GPS epoch). Rather than displaying
+					 * the GPS epoch date (from 1969), just print "No time sent". */
 					timestuff = (time_t) ntohl(vph->curtime.vtime_sec);
-					strftime(timestr, sizeof(timestr), "%Y %T", localtime(&timestuff));
-					ast_debug(4, "GPSTime:    %s.%09d from %s\n", timestr, ntohl(vph->curtime.vtime_nsec), client->name);
+					if (!timestuff) {
+						ast_debug(4, "GPSTime:    No time sent from %s\n", client->name);
+					} else {
+						strftime(timestr, sizeof(timestr), "%Y %T", localtime(&timestuff));
+						ast_debug(4, "GPSTime:    %s.%09d from %s\n", timestr, ntohl(vph->curtime.vtime_nsec), client->name);
+					}
 					/* Get and display the System time */
-					gettimeofday(&timetv, NULL);
+					timetv = ast_tvnow();
 					timetv.tv_usec = ((timetv.tv_usec + 10000) / 20000) * 20000;
 					if (timetv.tv_usec >= 1000000) {
 						timetv.tv_sec++;
@@ -6094,9 +6333,9 @@ process_gps:
 		ast_copy_string((char *) authpacket.vp.challenge, challenge, sizeof(authpacket.vp.challenge));
 
 		/* Put our current system time into the packet header. */
-		gettimeofday(&tv, NULL);
-		authpacket.vp.curtime.vtime_sec = htonl(tv.tv_sec);
-		authpacket.vp.curtime.vtime_nsec = htonl(tv.tv_usec * 1000);
+		systemtime = ast_tvnow();
+		authpacket.vp.curtime.vtime_sec = htonl(systemtime.tv_sec);
+		authpacket.vp.curtime.vtime_nsec = htonl(systemtime.tv_usec * 1000);
 
 		/* Make our response digest based on the challenge sent by the client, and our host password,
 		 * and put that in the packet header, along with blank flags.
@@ -6105,8 +6344,8 @@ process_gps:
 		authpacket.flags = 0;
 
 		/* Do the same for proxy authentication packets. */
-		proxy_authpacket.vp.curtime.vtime_sec = htonl(tv.tv_sec);
-		proxy_authpacket.vp.curtime.vtime_nsec = htonl(tv.tv_usec * 1000);
+		proxy_authpacket.vp.curtime.vtime_sec = htonl(systemtime.tv_sec);
+		proxy_authpacket.vp.curtime.vtime_nsec = htonl(systemtime.tv_usec * 1000);
 		proxy_authpacket.vp.digest = htonl(crc32_bufs((char *) vph->challenge, password));
 		proxy_authpacket.flags = 0;
 
