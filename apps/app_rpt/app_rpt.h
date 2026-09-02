@@ -1,6 +1,6 @@
 #define VERSION_MAJOR 3
 #define VERSION_MINOR 10
-#define VERSION_PATCH 1
+#define VERSION_PATCH 5
 
 #include "asterisk/audiohook.h"
 
@@ -600,7 +600,6 @@ struct rpt_link {
 	struct ast_channel *pchan;
 	struct ast_audiohook altaudio;
 	struct ast_str *linklist;
-	time_t linklistreceived;
 	int linklisttimer;
 	int linkunkeytocttimer;
 	struct timeval lastlinktv;

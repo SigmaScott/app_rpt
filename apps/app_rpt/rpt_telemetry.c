@@ -2328,7 +2328,6 @@ treataslocal:
 		} else if (!strcmp(myrpt->remoterig, REMOTE_RIG_RBI) || !strcmp(myrpt->remoterig, REMOTE_RIG_PPP16)) {
 #ifdef HAVE_SYS_IO
 			if (ioperm(myrpt->p.iobase, 1, 1) == -1) {
-				rpt_mutex_unlock(&myrpt->lock);
 				ast_log(LOG_WARNING, "Can't get io permission on IO port %x hex\n", myrpt->p.iobase);
 				res = -1;
 			} else {
@@ -3935,7 +3934,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 	rpt_mutex_unlock(&myrpt->lock);
 	res = ast_pthread_create_detached(&tele->threadid, NULL, rpt_tele_thread, (void *) tele);
 
-	if (res < 0) {
+	if (res) {
 		rpt_mutex_lock(&myrpt->lock);
 		tele_link_remove(myrpt, tele); /* We don't like stuck transmitters, remove it from the queue */
 		rpt_mutex_unlock(&myrpt->lock);
