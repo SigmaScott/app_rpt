@@ -1211,6 +1211,15 @@ enum rpt_function_response function_status(struct rpt *myrpt, char *param, char 
 	case 12: /* System Time (local only) */
 		rpt_telemetry(myrpt, STATS_TIME_LOCAL, NULL);
 		return DC_COMPLETE;
+	case 13: /* Local System status (ILINK, 5) */
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, LOCALSTATUS, NULL);
+		return DC_COMPLETE;
+	case 14: /* Local Full System status (ILINK, 15) */
+		rpt_telem_select(myrpt, command_source, mylink);
+		rpt_telemetry(myrpt, LOCALFULLSTATUS, NULL);
+		return DC_COMPLETE;
+
 	case 99: /* GPS data announced locally */
 		rpt_telem_select(myrpt, command_source, mylink);
 		rpt_telemetry(myrpt, STATS_GPS_LEGACY, NULL);
@@ -1236,7 +1245,7 @@ enum rpt_function_response function_macro(struct rpt *myrpt, char *param, char *
 		return DC_INDETERMINATE;
 	}
 
-	for (i = 0; i < digitbuf[i]; i++) {
+	for (i = 0; digitbuf[i]; i++) {
 		if ((digitbuf[i] < '0') || (digitbuf[i] > '9')) {
 			return DC_ERROR;
 		}
@@ -1858,6 +1867,8 @@ enum rpt_function_response function_cop(struct rpt *myrpt, char *param, char *di
 	case 58: /* TX CTCSS on input only Enable */
 		rpt_mutex_lock(&myrpt->lock);
 		myrpt->p.itxctcss = 1;
+		/* Force the main loop to publish the current aggregate input state. */
+		myrpt->lastitx = -1;
 		rpt_mutex_unlock(&myrpt->lock);
 		rpt_telem_select(myrpt, command_source, mylink);
 		rpt_telemetry(myrpt, ARB_ALPHA, (void *) "TXIPLENA");
@@ -1865,6 +1876,8 @@ enum rpt_function_response function_cop(struct rpt *myrpt, char *param, char *di
 	case 59: /* TX CTCSS on input only Disable */
 		rpt_mutex_lock(&myrpt->lock);
 		myrpt->p.itxctcss = 0;
+		/* Force an explicit CTCSS enable to clear a prior input-only request. */
+		myrpt->lastitx = -1;
 		rpt_mutex_unlock(&myrpt->lock);
 		rpt_telem_select(myrpt, command_source, mylink);
 		rpt_telemetry(myrpt, ARB_ALPHA, (void *) "TXIPLDIS");
@@ -2005,8 +2018,6 @@ enum rpt_function_response function_userout(struct rpt *myrpt, char *param, char
 enum rpt_function_response function_cmd(struct rpt *myrpt, char *param, char *digitbuf, enum rpt_command_source command_source,
 	struct rpt_link *mylink)
 {
-	char *cp;
-
 	if (myrpt->remote) {
 		return DC_ERROR;
 	}
@@ -2017,11 +2028,20 @@ enum rpt_function_response function_cmd(struct rpt *myrpt, char *param, char *di
 		if (*param == '#') { /* to execute asterisk cli command */
 			ast_cli_command(rpt_nullfd(), param + 2);
 		} else {
-			if (ast_asprintf(&cp, "%s &", param) < 0) {
+			char *parambuf;
+			char *argv[32];
+			int argc;
+
+			parambuf = ast_strdupa(param);
+			argc = ast_app_separate_args(parambuf, ' ', argv, ARRAY_LEN(argv) - 1);
+			argv[argc] = NULL;
+			if (argc > 0) {
+				if (ast_safe_execvp(1, argv[0], argv) < 0) {
+					return DC_ERROR;
+				}
+			} else {
 				return DC_ERROR;
 			}
-			ast_safe_system(cp);
-			ast_free(cp);
 		}
 	}
 	return DC_COMPLETE;

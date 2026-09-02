@@ -1,6 +1,6 @@
 #define VERSION_MAJOR 3
-#define VERSION_MINOR 9
-#define VERSION_PATCH 3
+#define VERSION_MINOR 10
+#define VERSION_PATCH 5
 
 #include "asterisk/audiohook.h"
 
@@ -315,7 +315,9 @@ enum rpt_phone_mode {
 	TELEMETRY_MODE(MDC1200) \
 	TELEMETRY_MODE(LASTUSER) \
 	TELEMETRY_MODE(REMCOMPLETE) \
-	TELEMETRY_MODE(PFXTONE)
+	TELEMETRY_MODE(PFXTONE) \
+	TELEMETRY_MODE(LOCALSTATUS) \
+	TELEMETRY_MODE(LOCALFULLSTATUS)
 
 enum rpt_tele_mode {
 #define TELEMETRY_MODE(name) name,
@@ -598,7 +600,6 @@ struct rpt_link {
 	struct ast_channel *pchan;
 	struct ast_audiohook altaudio;
 	struct ast_str *linklist;
-	time_t linklistreceived;
 	int linklisttimer;
 	int linkunkeytocttimer;
 	struct timeval lastlinktv;
@@ -779,7 +780,6 @@ struct rpt {
 	char *txchanname;
 	rpt_bool remote:1;
 	char *remoterig;
-	unsigned int scram;
 #ifdef _MDC_DECODE_H_
 	mdc_decoder_t *mdc;
 #endif
@@ -1150,7 +1150,7 @@ struct statpost {
 #define IS_LOCAL(c) (!strncasecmp(ast_channel_name(c), "Local", 5))
 #define IS_LOCAL_NAME(c) (!strncasecmp(c, "Local", 5))
 
-#define IS_ECHOLINK_NODE(n) (n && n[0] == '3') /* Echolink node numbers start with 3 */
+#define IS_ECHOLINK_NODE(n) (!ast_strlen_zero(n) && n[0] == '3') /* Echolink node numbers start with 3 */
 
 int rpt_debug_level(void);
 int rpt_set_debug_level(int newlevel);

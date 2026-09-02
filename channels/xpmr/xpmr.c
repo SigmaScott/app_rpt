@@ -2706,6 +2706,7 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 {
 	int i, hit;
 	float f = 0;
+	sig_atomic_t input_req;
 	t_pmr_sps *pmr_sps;
 
 	TRACEC(5, "PmrRx(%p %p %p %p)\n", pChan, input, outputrx, outputtx);
@@ -2850,7 +2851,7 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 			} else {
 				f = pChan->txctcssdefault_value;
 			}
-			if (f && pChan->spsSigGen0->freq != f * 10) {
+			if (f && pChan->spsSigGen0->freq != f * 10 && !pChan->b.txCtcssHangMuted) {
 				pChan->spsSigGen0->freq = f * 10;
 				pChan->spsSigGen0->option = 1;
 			}
@@ -2871,6 +2872,7 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 				pChan->rxCtcssMap[pChan->rxCtcss->decode]);
 			pChan->dd.b.doitnow = 1;
 			pChan->spsSigGen0->freq = 0;
+			pChan->b.txCtcssHangMuted = 0;
 			if (pChan->smode == SMODE_CTCSS && !pChan->b.txCtcssInhibit) {
 				if (pChan->rxCtcss->decode > CTCSS_NULL) {
 					if (pChan->rxCtcssMap[pChan->rxCtcss->decode] != CTCSS_RXONLY) {
@@ -2913,6 +2915,21 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 			pChan->txState = CHAN_TXSTATE_ACTIVE;
 			pChan->txPttOut = 1;
 
+			/*
+			 * Consume an input-only request that arrived while TX was idle.
+			 * An OFF request here suppresses CTCSS without a TOC because no
+			 * tone has yet been transmitted in this keyed period.
+			 */
+			input_req = __atomic_exchange_n(&pChan->txCtcssInputReq, TXCTCSS_INPUT_REQ_NONE, __ATOMIC_ACQ_REL);
+
+			if (input_req == TXCTCSS_INPUT_REQ_OFF) {
+				pChan->b.txCtcssHangMuted = 1;
+				pChan->b.txCtcssOff = 1;
+				pChan->spsSigGen0->option = 3;
+			} else if (input_req == TXCTCSS_INPUT_REQ_ON) {
+				pChan->b.txCtcssOff = 0;
+			}
+
 			pChan->txsettletimer = pChan->txsettletime;
 
 			if (pChan->spsTxOutA) {
@@ -2934,10 +2951,67 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 			TRACEC(1, "PmrRx() TxOn\n");
 		} else if (pChan->txPttIn && pChan->txState == CHAN_TXSTATE_ACTIVE) {
 			pChan->smodetimer = pChan->smodetime;
+
+			/*
+			 * Input-only CTCSS (app_rpt itxctcss → TXCTCSS): end or restore
+			 * encode while PTT is still held for hangtime. Do not watch local
+			 * COS — that cannot tell hangtime apart from linked/telemetry hold.
+			 * Classic mode (itxctcss off) never sends these requests; TOC runs
+			 * at actual txPttIn drop below.
+			 */
+			input_req = __atomic_exchange_n(&pChan->txCtcssInputReq, TXCTCSS_INPUT_REQ_NONE, __ATOMIC_ACQ_REL);
+
+			if (input_req == TXCTCSS_INPUT_REQ_ON) {
+				if (pChan->b.txCtcssHangMuted || pChan->b.txCtcssOff) {
+					pChan->b.txCtcssHangMuted = 0;
+					pChan->b.txCtcssOff = 0;
+					if (pChan->smode == SMODE_CTCSS && !pChan->b.txCtcssInhibit && pChan->b.ctcssTxEnable) {
+						f = 0;
+						if (pChan->rxCtcss->decode > CTCSS_NULL) {
+							/* RX-only codes leave f unset — do not encode. */
+							if (pChan->rxCtcssMap[pChan->rxCtcss->decode] != CTCSS_RXONLY) {
+								f = freq_ctcss[pChan->rxCtcssMap[pChan->rxCtcss->decode]];
+							}
+						} else {
+							/* No decoded code — use the configured default TX tone. */
+							f = pChan->txctcssdefault_value;
+						}
+						if (f > 0) {
+							pChan->spsSigGen0->freq = f * 10;
+							pChan->spsSigGen0->option = 1;
+							pChan->spsSigGen0->enabled = 1;
+							pChan->spsSigGen0->discounterl = 0;
+							TRACEC(1, "Tx CTCSS restore on TXCTCSS on during hang.\n");
+						} else {
+							TRACEC(1, "Tx CTCSS restore skipped: no valid frequency.\n");
+						}
+					}
+				}
+			} else if (input_req == TXCTCSS_INPUT_REQ_OFF) {
+				if (!pChan->b.txCtcssHangMuted && pChan->smode == SMODE_CTCSS && !pChan->b.txCtcssInhibit && pChan->b.ctcssTxEnable) {
+					pChan->b.txCtcssHangMuted = 1;
+					if (pChan->txTocType == TOC_NOTONE) {
+						/* Keep mute clear so chicken-burst silence is clean. */
+						pChan->b.txCtcssOff = 0;
+						pChan->spsSigGen0->option = 3;
+						TRACEC(1, "Tx CTCSS notone on TXCTCSS off.\n");
+					} else if (pChan->txTocType == TOC_PHASE) {
+						pChan->b.txCtcssOff = 0;
+						pChan->spsSigGen0->option = 2;
+						TRACEC(1, "Tx CTCSS phase turn-off on TXCTCSS off.\n");
+					} else {
+						pChan->b.txCtcssOff = 1;
+						TRACEC(1, "Tx CTCSS mute on TXCTCSS off.\n");
+					}
+				} else if (!pChan->b.txCtcssHangMuted) {
+					pChan->b.txCtcssOff = 1;
+				}
+			}
 		} else if (!pChan->txPttIn && pChan->txState == CHAN_TXSTATE_ACTIVE) {
 			TRACEC(1, "txPttIn==0 from CHAN_TXSTATE_ACTIVE\n");
 			if (pChan->smode == SMODE_CTCSS && !pChan->b.txCtcssInhibit) {
-				if (pChan->txTocType == TOC_NONE || !pChan->b.ctcssTxEnable) {
+				if (pChan->txTocType == TOC_NONE || !pChan->b.ctcssTxEnable || pChan->b.txCtcssHangMuted) {
+					/* Immediate off, or tone already ended for input-only. */
 					TRACEC(1, "Tx Off Immediate.\n");
 					pChan->spsSigGen0->option = 3;
 					pChan->txBufferClear = 3;
@@ -2962,6 +3036,8 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 			if (pChan->txPttIn && pChan->smode == SMODE_CTCSS) {
 				TRACEC(1, "Tx Key During HangTime\n");
 				pChan->txState = CHAN_TXSTATE_ACTIVE;
+				pChan->b.txCtcssHangMuted = 0;
+				pChan->b.txCtcssOff = 0;
 				pChan->spsSigGen0->option = 1;
 				pChan->spsSigGen0->enabled = 1;
 				pChan->spsSigGen0->discounterl = 0;
@@ -2988,6 +3064,8 @@ i16 PmrRx(t_pmr_chan *pChan, i16 *input, i16 *outputrx, i16 *outputtx)
 		pChan->txPttOut = 0;
 		pChan->spsSigGen0->option = 3;
 		pChan->txrxblankingtimer = pChan->txrxblankingtime;
+		pChan->b.txCtcssHangMuted = 0;
+		pChan->b.txCtcssOff = 0;
 		TRACEC(1, "PmrRx() txrxblankingtimer=%i\n", pChan->txrxblankingtimer);
 		pChan->txState = CHAN_TXSTATE_IDLE;
 		if (pChan->spsTxLsdLpf) {
@@ -3454,6 +3532,32 @@ void dedrift(t_pmr_chan *pChan)
 
 /*
  */
+void dedrift_reset(t_pmr_chan *pChan)
+{
+	size_t bytes;
+
+	if (!pChan || !pChan->dd.buff) {
+		return;
+	}
+
+	bytes = pChan->dd.buffersize > 0 ? (size_t) pChan->dd.buffersize * sizeof(i16)
+									 : (size_t) DDB_FRAME_SIZE * DDB_FRAMES_IN_BUFF * sizeof(i16);
+	memset(pChan->dd.buff, 0, bytes);
+	pChan->dd.inputindex = 0;
+	pChan->dd.outputindex = 0;
+	pChan->dd.skew = pChan->dd.lead = pChan->dd.err = 0;
+	pChan->dd.accum = 0;
+	pChan->dd.z1 = 0;
+	pChan->dd.lock = 0;
+	pChan->dd.b.txlock = pChan->dd.b.rxlock = 0;
+	pChan->dd.b.twiddle = pChan->dd.b.doitnow = 0;
+	pChan->dd.initcnt = 2;
+	pChan->dd.timer = 10000 / 20;
+	pChan->dd.drift = 0;
+	pChan->dd.factor = pChan->dd.x1 = pChan->dd.x0 = pChan->dd.y1 = pChan->dd.y0 = 0;
+	pChan->dd.txframecnt = pChan->dd.rxframecnt = 0;
+}
+
 void dedrift_write(t_pmr_chan *pChan, i16 *src)
 {
 	void *vptr;

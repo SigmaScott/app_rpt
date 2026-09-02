@@ -569,6 +569,11 @@ done:
 	return 0;
 }
 
+/** \brief Check if there is any priority telemetry pending
+ * \note Must be called locked with myrpt->lock held
+ * \param myrpt The repeater structure
+ * \return 1 if priority telemetry is pending, 0 otherwise
+ */
 int priority_telemetry_pending(struct rpt *myrpt)
 {
 	struct rpt_tele *telem;
@@ -577,8 +582,6 @@ int priority_telemetry_pending(struct rpt *myrpt)
 	if (!myrpt) {
 		return 0;
 	}
-
-	rpt_mutex_lock(&myrpt->lock);
 
 	/* Traverse the telemetry list looking for override_tot flag */
 	telem = myrpt->tele.next;
@@ -600,7 +603,6 @@ int priority_telemetry_pending(struct rpt *myrpt)
 		telem = telem->next;
 	}
 
-	rpt_mutex_unlock(&myrpt->lock);
 	return pending;
 }
 
@@ -1416,7 +1418,7 @@ static int handle_varcmd_tele(struct rpt *myrpt, struct ast_channel *mychannel, 
 		return 0;
 	}
 
-	if (!strcasecmp(strs[0], "STATUS")) {
+	if (!strcasecmp(strs[0], "STATUS") || !strcasecmp(strs[0], "LOCALSTATUS")) {
 		if (n < 3) {
 			return 0;
 		}
@@ -2326,7 +2328,6 @@ treataslocal:
 		} else if (!strcmp(myrpt->remoterig, REMOTE_RIG_RBI) || !strcmp(myrpt->remoterig, REMOTE_RIG_PPP16)) {
 #ifdef HAVE_SYS_IO
 			if (ioperm(myrpt->p.iobase, 1, 1) == -1) {
-				rpt_mutex_unlock(&myrpt->lock);
 				ast_log(LOG_WARNING, "Can't get io permission on IO port %x hex\n", myrpt->p.iobase);
 				res = -1;
 			} else {
@@ -3451,7 +3452,7 @@ treataslocal:
 	}
 #endif
 	myrpt->noduck = 0;
-	pthread_exit(NULL);
+	return NULL;
 abort:
 	telem_done(myrpt, mytele);
 abort2:
@@ -3471,7 +3472,7 @@ abort3:
 		ast_channel_unref(mychannel);
 	}
 
-	pthread_exit(NULL);
+	return NULL;
 }
 
 static const char *rpt_tele_mode_str(enum rpt_tele_mode mode)
@@ -3497,7 +3498,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 	time_t t, t_mono, was_mono;
 	unsigned long long u_mono;
 	char gps_data[100], lat[25], lon[25], elev[25];
-	struct ast_str *lbuf;
+	struct ast_str *lbuf, *lbuf2;
 	struct ao2_iterator l_it;
 
 	ast_debug(6, "Tracepoint rpt_telemetry() entered mode=%s\n", rpt_tele_mode_str(mode));
@@ -3534,7 +3535,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 		break;
 
 	case VARCMD:
-		if (myrpt->telemmode < 2 && strncasecmp((char *) data, "STATUS,", 7)) {
+		if (myrpt->telemmode < 2 && strncasecmp((char *) data, "LOCALSTATUS,", 12)) {
 			return;
 		}
 
@@ -3769,13 +3770,25 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 			return;
 
 		case STATUS:
+		case LOCALSTATUS:
 			rpt_mutex_lock(&myrpt->lock);
 			if (!myrpt->links) {
 				rpt_mutex_unlock(&myrpt->lock);
 				return;
 			}
 
-			snprintf(mystr, sizeof(mystr), "STATUS,%s,%d", myrpt->name, myrpt->callmode);
+			lbuf = ast_str_create(RPT_AST_STR_INIT_SIZE);
+			if (!lbuf) {
+				rpt_mutex_unlock(&myrpt->lock);
+				return;
+			}
+
+			if (mode == STATUS) {
+				ast_str_set(&lbuf, 0, "STATUS,%s,%d", myrpt->name, myrpt->callmode);
+			} else {
+				ast_str_set(&lbuf, 0, "LOCALSTATUS,%s,%d", myrpt->name, myrpt->callmode);
+			}
+
 			/* make our own list of links */
 			RPT_LIST_TRAVERSE(myrpt->links, l, l_it) {
 				char s;
@@ -3795,21 +3808,38 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 					s = 'C';
 				}
 
-				snprintf(mystr + strlen(mystr), sizeof(mystr), ",%c%s", s, l->name);
+				ast_str_append(&lbuf, 0, ",%c%s", s, l->name);
 			}
 
 			ao2_iterator_destroy(&l_it);
 			rpt_mutex_unlock(&myrpt->lock);
-			send_tele_link(myrpt, mystr);
+
+			if (mode == STATUS) {
+				send_tele_link(myrpt, ast_str_buffer(lbuf));
+			} else {
+				rpt_telemetry(myrpt, VARCMD, ast_str_buffer(lbuf));
+			}
+
+			ast_free(lbuf);
 			return;
 
 		case FULLSTATUS:
+		case LOCALFULLSTATUS:
 			lbuf = ast_str_create(RPT_AST_STR_INIT_SIZE);
 			if (!lbuf) {
 				return;
 			}
 
-			snprintf(mystr, sizeof(mystr), "STATUS,%s,%d", myrpt->name, myrpt->callmode);
+			lbuf2 = ast_str_create(RPT_AST_STR_INIT_SIZE);
+			if (!lbuf2) {
+				ast_free(lbuf);
+				return;
+			}
+			if (mode == FULLSTATUS) {
+				ast_str_set(&lbuf2, 0, "STATUS,%s,%d", myrpt->name, myrpt->callmode);
+			} else {
+				ast_str_set(&lbuf2, 0, "LOCALSTATUS,%s,%d", myrpt->name, myrpt->callmode);
+			}
 
 			/* get all the nodes */
 			rpt_mutex_lock(&myrpt->lock);
@@ -3820,6 +3850,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 			strs = ast_malloc(n * sizeof(char *));
 			if (!strs) {
 				ast_free(lbuf);
+				ast_free(lbuf2);
 				return;
 			}
 			ns = finddelim(ast_str_buffer(lbuf), strs, n);
@@ -3847,12 +3878,18 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 					s = 'C';
 				}
 
-				snprintf(mystr + strlen(mystr), sizeof(mystr), ",%c%s", s, strs[i]);
+				ast_str_append(&lbuf2, 0, ",%c%s", s, strs[i]);
 			}
 
-			send_tele_link(myrpt, mystr);
+			if (mode == FULLSTATUS) {
+				send_tele_link(myrpt, ast_str_buffer(lbuf2));
+			} else {
+				rpt_telemetry(myrpt, VARCMD, ast_str_buffer(lbuf2));
+			}
+
 			ast_free(strs);
 			ast_free(lbuf);
+			ast_free(lbuf2);
 			return;
 
 		default:
@@ -3897,7 +3934,7 @@ void rpt_telemetry(struct rpt *myrpt, enum rpt_tele_mode mode, void *data)
 	rpt_mutex_unlock(&myrpt->lock);
 	res = ast_pthread_create_detached(&tele->threadid, NULL, rpt_tele_thread, (void *) tele);
 
-	if (res < 0) {
+	if (res) {
 		rpt_mutex_lock(&myrpt->lock);
 		tele_link_remove(myrpt, tele); /* We don't like stuck transmitters, remove it from the queue */
 		rpt_mutex_unlock(&myrpt->lock);
